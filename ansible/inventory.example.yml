@@ -1,0 +1,74 @@
+# Copy this file to ansible/inventory.yml (git-ignored) and edit for your Proxmox environment.
+# Export API token before running playbooks:
+#   export VP_API_TOKEN_ID="automation"
+#   export VP_API_TOKEN_SECRET="your-secret-token"
+all:
+  vars:
+    # Proxmox API endpoint
+    pve_api_host: pve.example.local
+    pve_api_port: 8006
+    pve_api_user: root@pam
+    pve_validate_certs: true
+    # pve_api_ca_file: ./pve-ca.pem   # optional: pin custom CA cert
+
+    # Existing LAN / management network (vmbr0 is never modified)
+    vmp_lan_bridge: vmbr0
+    vmp_lan_cidr: 192.168.100.0/24
+    vmp_lan_gateway: 192.168.100.1
+    vmp_lan_pool_prefix: "192.168.100."
+    vmp_lan_pool_start: 50
+    vmp_lan_pool_end: 99
+
+    # Two unused static LAN IPs for the shared Gateway and Bastion SSH ingress
+    vmp_gateway_lan_ip: 192.168.100.250
+    vmp_bastion_lan_ip: 192.168.100.251
+
+    # Controller SSH keypair for managing Gateway & Bastion
+    vmp_admin_ssh_public_key_file: ~/.ssh/id_ed25519.pub
+    vmp_admin_ssh_private_key_file: ~/.ssh/id_ed25519
+    vmp_known_hosts_file: ./.vmp_known_hosts
+
+    # Proxmox storage names (defaults: local-lvm for VM disks, local for cloud images)
+    vmp_vm_storage: local-lvm
+    vmp_image_storage: local
+
+    # Optional: override private VXLAN networks if defaults (10.100.1.0/24 & 10.100.10.0/24) overlap
+    # vmp_internal_vni: 1001
+    # vmp_internal_cidr: 10.100.1.0/24
+    # vmp_internal_gateway: 10.100.1.1
+    # vmp_internal_bastion: 10.100.1.2
+    # vmp_internal_pool_prefix: "10.100.1."
+    # vmp_isolated_vni: 1002
+    # vmp_isolated_cidr: 10.100.10.0/24
+    # vmp_isolated_gateway: 10.100.10.1
+    # vmp_isolated_bastion: 10.100.10.2
+    # vmp_isolated_pool_prefix: "10.100.10."
+
+    # Optional: override cloud image filenames if yours differ from defaults
+    # vmp_os_catalog:
+    #   debian-13:
+    #     volume: "local:import/debian-13-genericcloud-amd64.qcow2"
+    #     filename: "debian-13-genericcloud-amd64.qcow2"
+    #     min_disk_gib: 8
+    #     min_memory_mib: 512
+
+    # Optional: extra protected infrastructure CIDRs blocked from all VMs
+    # vmp_extra_protected_cidrs:
+    #   - 192.168.100.2/32
+
+  children:
+    proxmox_nodes:
+      hosts:
+        pve01:
+          ansible_host: 192.168.100.10
+          ansible_user: proxmox-admin
+          ansible_become: true
+          ansible_become_method: sudo
+          ansible_python_interpreter: /usr/bin/python3
+        # Add more nodes in the same Proxmox cluster here, then re-run init.yml:
+        # pve02:
+        #   ansible_host: 192.168.100.11
+        #   ansible_user: proxmox-admin
+        #   ansible_become: true
+        #   ansible_become_method: sudo
+        #   ansible_python_interpreter: /usr/bin/python3

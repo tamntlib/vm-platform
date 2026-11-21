@@ -1,0 +1,26 @@
+# Managed by vm-platform init.yml — private bridges only.
+{% set vxlan_peers = [] %}
+{% for peer in groups['proxmox_nodes'] | default([]) %}
+{%   if peer != inventory_hostname %}
+{%     set _ = vxlan_peers.append(hostvars[peer].ansible_host) %}
+{%   endif %}
+{% endfor %}
+{% for net_name in ['internal', 'isolated'] %}
+{% set net = vmp_networks[net_name] %}
+auto {{ net.vxlan }}
+iface {{ net.vxlan }} inet manual
+    vxlan-id {{ net.vni }}
+    vxlan-local-tunnelip {{ ansible_host }}
+    vxlan-port {{ net.vxlan_port }}
+    vxlan-learning {{ 'yes' if (vxlan_peers | length) > 0 else 'no' }}
+    mtu {{ net.mtu }}
+{% for peer_ip in vxlan_peers | sort %}
+    vxlan-remoteip {{ peer_ip }}
+{% endfor %}
+
+auto {{ net.bridge }}
+iface {{ net.bridge }} inet manual
+    bridge-ports {{ net.vxlan }}
+    post-up /usr/sbin/ip link set dev {{ net.bridge }} mtu {{ net.mtu }}
+
+{% endfor %}

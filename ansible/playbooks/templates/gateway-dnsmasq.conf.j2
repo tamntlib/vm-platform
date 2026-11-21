@@ -1,0 +1,11 @@
+# Managed by vm-platform — DNS forwarder for private networks only.
+port=53
+bind-interfaces
+listen-address={{ vmp_networks.internal.gateway }}
+listen-address={{ vmp_networks.isolated.gateway }}
+no-resolv
+no-hosts
+no-dhcp-interface=*
+{% for upstream in vmp_dns_upstreams %}
+server={{ upstream }}
+{% endfor %}

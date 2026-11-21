@@ -1,0 +1,14 @@
+---
+vm:
+  name: app01
+  profile: isolated          # isolated | internal | lan
+  os: debian-13              # see vmp_os_catalog in roles/defaults/defaults/main.yml
+  cores: 2
+  memory_mib: 2048
+  disk_gib: 20
+  ssh_user: appadmin
+  ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithRealKey user@host"
+  # node: pve02              # optional: target Proxmox node (defaults to first node in proxmox_nodes)
+  # internet_egress: false   # optional: set true to allow outbound Internet via gateway
+  # vmid: 110                # optional: omit to auto-pick next free VMID from Proxmox
+  # ip: 10.100.10.30         # optional: omit to auto-pick next free IP from profile pool

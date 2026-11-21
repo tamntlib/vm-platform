@@ -1,0 +1,17 @@
+# Local state, user inventory and secrets
+/.local/
+/compose.override.yaml
+/.auth/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.ovpn
+ansible/inventory.yml
+ansible/.vmp_known_hosts
+ansible/vm-*.yml
+
+# Generated Python output
+__pycache__/
+*.py[cod]

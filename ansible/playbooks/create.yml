@@ -1,0 +1,515 @@
+---
+# Create one VM from a YAML request file (-e @vm.yml):
+#   1. Validate request, select target cluster node, auto-pick free VMID/IP across the cluster
+#   2. Import approved cloud image onto local-lvm, configure Cloud-init & PVE Firewall BEFORE boot
+#   3. Add ONLY this VM's DNS/SSH entries on shared Gateway & Bastion (no downtime, never touches other VMs)
+#   4. Boot VM and print ready-to-use SSH command
+
+- name: "1/5 Validate VM request, provision VM on local-lvm, and apply firewall before boot"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_port: "{{ pve_api_port }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_validate_certs }}"
+      ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+  tasks:
+    - name: Resolve target Proxmox node
+      ansible.builtin.set_fact:
+        _target_node: "{{ vm.node | default(pve_primary_node) }}"
+      when: vm is defined and vm is mapping
+      check_mode: false
+
+    - name: Validate required vm request fields
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - vm is defined and vm is mapping
+          - _target_node in (groups['proxmox_nodes'] | default([]))
+          - (vm.name | default('')) is match('^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$')
+          - (vm.profile | default('')) in ['isolated', 'internal', 'lan']
+          - (vm.os | default('')) in vmp_os_catalog
+          - (vm.cores | default(1) | int) >= 1
+          - (vm.memory_mib | default(1024) | int) >= (vmp_os_catalog[vm.os].min_memory_mib | int)
+          - (vm.disk_gib | default(16) | int) >= (vmp_os_catalog[vm.os].min_disk_gib | int)
+          - (vm.ssh_user | default('')) is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - (vm.ssh_public_key | default('')) is match('^ssh-(ed25519|rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]+')
+        fail_msg: "Invalid vm declaration. Check vm.example.yml for required fields."
+      check_mode: false
+
+    - name: Require Proxmox API credentials
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - pve_api_token_id | length > 0
+          - pve_api_token_secret | length > 0
+        fail_msg: "Set VP_API_TOKEN_ID and VP_API_TOKEN_SECRET in environment."
+      check_mode: false
+
+    - name: Query cluster VM/CT resources from Proxmox API
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/resources?type=vm"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: cluster_vms
+      check_mode: false
+      no_log: true
+
+    - name: Require Gateway and Bastion to be initialized and running
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_gateway.vmid | int) | selectattr('status', 'equalto', 'running') | list | length) == 1
+          - (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_bastion.vmid | int) | selectattr('status', 'equalto', 'running') | list | length) == 1
+        fail_msg: "Shared Gateway ({{ vmp_gateway.vmid }}) and Bastion ({{ vmp_bastion.vmid }}) must be running. Run init.yml first."
+      check_mode: false
+
+    - name: Refuse duplicate VM name across cluster
+      ansible.builtin.assert:
+        quiet: true
+        that: vm.name not in (cluster_vms.json.data | selectattr('name', 'defined') | map(attribute='name') | list)
+        fail_msg: "VM named '{{ vm.name }}' already exists in Proxmox cluster."
+      check_mode: false
+
+    - name: Read existing QEMU configs across all cluster nodes to detect used IPs
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ item.node }}/qemu/{{ item.vmid }}/config"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      loop: "{{ cluster_vms.json.data | selectattr('type', 'equalto', 'qemu') | list }}"
+      register: vm_configs
+      check_mode: false
+      no_log: true
+
+    - name: Read existing profile IPSet members from Proxmox firewall
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/ipset/vmp_{{ vm.profile }}"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: profile_ipset
+      check_mode: false
+      no_log: true
+
+    - name: Collect protected CIDRs, occupied VMIDs, and occupied IPs across cluster
+      ansible.builtin.set_fact:
+        _protected_cidrs: >-
+          {%- set cidrs = [
+            vmp_lan_gateway ~ '/32',
+            vmp_gateway.lan_ip ~ '/32',
+            vmp_gateway.bastion_alias_ip ~ '/32',
+            vmp_networks.internal.gateway ~ '/32',
+            vmp_networks.internal.bastion ~ '/32',
+            vmp_networks.isolated.gateway ~ '/32',
+            vmp_networks.isolated.bastion ~ '/32'
+          ] -%}
+          {%- for n in groups['proxmox_nodes'] -%}
+            {%- set _ = cidrs.append(hostvars[n].ansible_host ~ '/32') -%}
+          {%- endfor -%}
+          {%- for extra in vmp_extra_protected_cidrs | default([]) -%}
+            {%- set _ = cidrs.append(extra) -%}
+          {%- endfor -%}
+          {{ cidrs | unique | list }}
+        _used_vmids: "{{ cluster_vms.json.data | map(attribute='vmid') | map('int') | list }}"
+        _net: "{{ vmp_networks[vm.profile] }}"
+        _os: "{{ vmp_os_catalog[vm.os] }}"
+      check_mode: false
+
+    - name: Collect all used IP addresses across cluster
+      ansible.builtin.set_fact:
+        _used_ips: >-
+          {%- set ips = [] -%}
+          {%- for cfg in vm_configs.results | default([]) -%}
+            {%- for k, v in (cfg.json.data | default({})).items() -%}
+              {%- if k.startswith('ipconfig') and 'ip=' in (v | string) -%}
+                {%- set ip_part = ((v | string).split('ip=')[1].split(',')[0].split('/')[0]) -%}
+                {%- set _ = ips.append(ip_part) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- for row in profile_ipset.json.data | default([]) -%}
+            {%- set _ = ips.append(row.cidr.split('/')[0]) -%}
+          {%- endfor -%}
+          {%- for p in _protected_cidrs -%}
+            {%- set _ = ips.append(p.split('/')[0]) -%}
+          {%- endfor -%}
+          {{ ips | unique | list }}
+      check_mode: false
+
+    - name: Resolve VMID and IP (use caller value or auto-pick next free)
+      ansible.builtin.set_fact:
+        _vmid: >-
+          {%- if vm.vmid is defined -%}
+            {{ vm.vmid | int }}
+          {%- else -%}
+            {%- set free_ids = range(vmp_vmid_min | int, (vmp_vmid_max | int) + 1) | reject('in', _used_vmids) | list -%}
+            {{ free_ids[0] if free_ids | length > 0 else 0 }}
+          {%- endif -%}
+        _vm_ip: >-
+          {%- if vm.ip is defined -%}
+            {{ vm.ip }}
+          {%- else -%}
+            {%- set candidates = [] -%}
+            {%- for host_num in range(_net.pool_start | int, (_net.pool_end | int) + 1) -%}
+              {%- set addr = _net.pool_prefix ~ (host_num | string) -%}
+              {%- if addr not in _used_ips -%}
+                {%- set _ = candidates.append(addr) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ candidates[0] if candidates | length > 0 else '' }}
+          {%- endif -%}
+      check_mode: false
+
+    - name: Assert resolved VMID and IP are valid and free
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (_vmid | int) >= (vmp_vmid_min | int)
+          - (_vmid | int) not in _used_vmids
+          - (_vm_ip | length) > 0
+          - _vm_ip not in _used_ips
+          - (_vm_ip ~ '/32') not in _protected_cidrs
+        fail_msg: "Unable to allocate valid free VMID ({{ _vmid }}) or IP ({{ _vm_ip }}) for profile {{ vm.profile }}."
+      check_mode: false
+
+    - name: Compute deterministic local MAC, nameservers, and bastion jump username
+      ansible.builtin.set_fact:
+        _vm_vmid: "{{ _vmid | int }}"
+        _vm_mac: >-
+          {%- set h = (vm.name ~ '-' ~ (_vmid | string)) | hash('sha256') -%}
+          02:{{ h[0:2] }}:{{ h[2:4] }}:{{ h[4:6] }}:{{ h[6:8] }}:{{ h[8:10] }}
+        _vm_nameservers: "{{ vmp_lan_nameservers if vm.profile == 'lan' else [_net.gateway] }}"
+        _vm_jump_user: "vmp-{{ _vmid | int }}"
+        _vm_egress: "{{ vm.internet_egress | default(false) | bool }}"
+      check_mode: false
+
+    - name: Verify selected OS cloud image exists on {{ _target_node }}:{{ vmp_image_storage }}
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _target_node }}/storage/{{ vmp_image_storage }}/content?content=import"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _import_list
+      check_mode: false
+      no_log: true
+
+    - name: Assert selected cloud image is present on {{ _target_node }}
+      ansible.builtin.assert:
+        quiet: true
+        that: _os.volume in (_import_list.json.data | map(attribute='volid') | list)
+        fail_msg: "Cloud image '{{ _os.volume }}' is missing on {{ _target_node }}:{{ vmp_image_storage }}. Download it to /var/lib/vz/import/{{ _os.filename }} first."
+      check_mode: false
+
+    - name: Preview resolved VM plan in --check mode (no changes made)
+      ansible.builtin.debug:
+        msg:
+          dry_run: true
+          node: "{{ _target_node }}"
+          vmid: "{{ _vm_vmid | int }}"
+          name: "{{ vm.name }}"
+          profile: "{{ vm.profile }}"
+          os: "{{ vm.os }}"
+          ip: "{{ _vm_ip }}/{{ _net.prefixlen }}"
+          mac: "{{ _vm_mac }}"
+          bridge: "{{ _net.bridge }}"
+          storage: "{{ vmp_vm_storage }}"
+          cores: "{{ vm.cores | default(1) | int }}"
+          memory_mib: "{{ vm.memory_mib | default(1024) | int }}"
+          disk_gib: "{{ vm.disk_gib | default(16) | int }}"
+          internet_egress: "{{ _vm_egress }}"
+          bastion_user: "{{ _vm_jump_user }}"
+      when: ansible_check_mode
+
+    - name: Create VM ({{ _vm_vmid }}) stopped on {{ _target_node }}/{{ vmp_vm_storage }} with Cloud-init
+      community.proxmox.proxmox_kvm:
+        node: "{{ _target_node }}"
+        vmid: "{{ _vm_vmid | int }}"
+        name: "{{ vm.name }}"
+        description: "vm-platform profile={{ vm.profile }} os={{ vm.os }}"
+        cores: "{{ vm.cores | default(1) | int }}"
+        memory: "{{ vm.memory_mib | default(1024) | int }}"
+        cpu: host
+        scsihw: virtio-scsi-single
+        scsi:
+          scsi0: "{{ vmp_vm_storage }}:0,import-from={{ _os.volume }}"
+        ide:
+          ide2: "{{ vmp_vm_storage }}:cloudinit"
+        net:
+          net0: "virtio={{ _vm_mac }},bridge={{ _net.bridge }},firewall=1,mtu={{ _net.mtu }}"
+        ipconfig:
+          ipconfig0: "ip={{ _vm_ip }}/{{ _net.prefixlen }},gw={{ _net.gateway }}"
+        nameservers: "{{ _vm_nameservers }}"
+        ciuser: "{{ vm.ssh_user }}"
+        sshkeys: "{{ vm.ssh_public_key | trim }}"
+        ciupgrade: false
+        onboot: false
+        boot: order=scsi0
+        serial:
+          serial0: socket
+        vga: serial0
+        agent: "yes"
+        timeout: 180
+        state: present
+      when: not ansible_check_mode
+
+    - name: Resize VM ({{ _vm_vmid }}) disk to {{ vm.disk_gib | default(16) }}G
+      community.proxmox.proxmox_disk:
+        vmid: "{{ _vm_vmid | int }}"
+        disk: scsi0
+        size: "{{ vm.disk_gib | default(16) }}G"
+        state: resized
+      when: not ansible_check_mode
+
+    - name: Register VM IP {{ _vm_ip }}/32 in cluster IPSet vmp_{{ vm.profile }} (preserves other VMs)
+      community.proxmox.proxmox_firewall:
+        level: cluster
+        update: true
+        state: present
+        ip_sets:
+          - name: "vmp_{{ vm.profile }}"
+            cidrs:
+              - cidr: "{{ _vm_ip }}/32"
+                comment: "vm-{{ _vm_vmid }} {{ vm.name }}"
+      when: not ansible_check_mode
+
+    - name: Apply PVE Firewall policy to VM ({{ _vm_vmid }}) BEFORE booting
+      ansible.builtin.include_tasks: tasks/pve-vm-firewall.yml
+      vars:
+        fw_node: "{{ _target_node }}"
+        fw_vmid: "{{ _vm_vmid | int }}"
+        fw_ip_sets:
+          - name: ipfilter-net0
+            cidrs:
+              - cidr: "{{ _vm_ip }}/32"
+        fw_options:
+          enable: 1
+          dhcp: 0
+          ndp: 0
+          radv: 0
+          ipfilter: 1
+          macfilter: 1
+          policy_in: DROP
+          policy_out: DROP
+        fw_rules: >-
+          {{
+            [
+              {'type': 'in',  'action': 'DROP',   'source': '::/0', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest':   '::/0', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'source': _net.bastion ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1}
+            ]
+            + (
+              [
+                {'type': 'out', 'action': 'ACCEPT', 'dest': _net.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
+                {'type': 'out', 'action': 'ACCEPT', 'dest': _net.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1}
+              ] if vm.profile in ['isolated', 'internal'] else []
+            )
+            + [{'type': 'group', 'action': 'vmp_' ~ vm.profile, 'enable': 1}]
+            + ([{'type': 'out', 'action': 'ACCEPT', 'dest': '0.0.0.0/0', 'enable': 1}] if _vm_egress else [])
+          }}
+
+    - name: Register Gateway and Bastion in dynamic inventory for per-VM grant update
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_connection: ssh
+        ansible_host: "{{ item.host }}"
+        ansible_user: "{{ vmp_admin_user }}"
+        ansible_ssh_private_key_file: "{{ vmp_admin_ssh_private_key_file }}"
+        ansible_ssh_common_args: "{{ item.ssh_args }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_remote_tmp: /tmp/.ansible-vmp
+      loop:
+        - name: vmp_gateway
+          host: "{{ vmp_gateway.lan_ip }}"
+          ssh_args: "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+        - name: vmp_bastion
+          host: "{{ vmp_bastion.internal_ip }}"
+          ssh_args: >-
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+            -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+      when: not ansible_check_mode
+
+- name: "2/5 Add only this VM's DNS/route grant on existing Gateway"
+  hosts: vmp_gateway
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _vm_vmid: "{{ hostvars.localhost._vm_vmid }}"
+    _vm_ip: "{{ hostvars.localhost._vm_ip }}"
+    _vm_egress: "{{ hostvars.localhost._vm_egress }}"
+  tasks:
+    - name: Write per-VM nftables drop-in (does not touch other VMs)
+      ansible.builtin.copy:
+        dest: "/etc/vm-platform-gateway/clients.d/vm-{{ _vm_vmid }}.nft"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # VM {{ _vm_vmid }} ({{ vm.name }}, profile={{ vm.profile }})
+          {% if vm.profile == 'internal' %}
+          add element inet vmp_gw dns_internal { {{ _vm_ip }} }
+          {% if _vm_egress %}
+          add element inet vmp_gw egress_internal { {{ _vm_ip }} }
+          {% endif %}
+          {% elif vm.profile == 'isolated' %}
+          add element inet vmp_gw dns_isolated { {{ _vm_ip }} }
+          {% if _vm_egress %}
+          add element inet vmp_gw egress_isolated { {{ _vm_ip }} }
+          {% endif %}
+          {% elif vm.profile == 'lan' %}
+          add element inet vmp_gw lan_ssh_targets { {{ _vm_ip }} }
+          {% endif %}
+      when: not ansible_check_mode
+
+    - name: Validate Gateway nftables ruleset before reload
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, -c, -f, /etc/vm-platform-gateway/gateway.nft]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Reload vmp-gateway.service
+      ansible.builtin.systemd_service:
+        name: vmp-gateway.service
+        state: reloaded
+      when: not ansible_check_mode
+
+- name: "3/5 Add only this VM's SSH ProxyJump grant on existing Bastion"
+  hosts: vmp_bastion
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _vm_vmid: "{{ hostvars.localhost._vm_vmid }}"
+    _vm_ip: "{{ hostvars.localhost._vm_ip }}"
+    _vm_jump_user: "{{ hostvars.localhost._vm_jump_user }}"
+  tasks:
+    - name: Create forwarding-only jump account {{ _vm_jump_user }}
+      ansible.builtin.user:
+        name: "{{ _vm_jump_user }}"
+        group: vmpjump
+        shell: /usr/sbin/nologin
+        create_home: false
+        system: true
+        state: present
+      when: not ansible_check_mode
+
+    - name: Install restricted public key for {{ _vm_jump_user }}
+      ansible.builtin.copy:
+        dest: "/etc/vm-platform-bastion/keys/{{ _vm_jump_user }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: "restrict,port-forwarding {{ vm.ssh_public_key | trim }}\n"
+      when: not ansible_check_mode
+
+    - name: Write per-VM Bastion Match block (does not touch other VMs)
+      ansible.builtin.copy:
+        dest: "/etc/vm-platform-bastion/users.d/vm-{{ _vm_vmid }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # VM {{ _vm_vmid }} ({{ vm.name }}, profile={{ vm.profile }})
+          Match User {{ _vm_jump_user }}
+              AuthorizedKeysFile /etc/vm-platform-bastion/keys/%u
+              AllowTcpForwarding local
+              PermitOpen {{ _vm_ip }}:22
+              MaxSessions 0
+              ForceCommand /usr/bin/false
+              PermitTTY no
+              AllowAgentForwarding no
+              AllowStreamLocalForwarding no
+              X11Forwarding no
+              PermitListen none
+      when: not ansible_check_mode
+
+    - name: Validate Bastion sshd_config before reload
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -t, -f, /etc/vm-platform-bastion/sshd_config]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Reload vmp-bastion.service
+      ansible.builtin.systemd_service:
+        name: vmp-bastion.service
+        state: reloaded
+      when: not ansible_check_mode
+
+- name: "4/5 Boot VM"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_port: "{{ pve_api_port }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_validate_certs }}"
+      ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+  tasks:
+    - name: Start VM ({{ _vm_vmid }}) on {{ _target_node }}
+      community.proxmox.proxmox_kvm:
+        node: "{{ _target_node }}"
+        vmid: "{{ _vm_vmid | int }}"
+        state: started
+      when: not ansible_check_mode
+
+- name: "5/5 Wait for VM SSH readiness and print access details"
+  hosts: vmp_bastion
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _target_node: "{{ hostvars.localhost._target_node }}"
+    _vm_vmid: "{{ hostvars.localhost._vm_vmid }}"
+    _vm_ip: "{{ hostvars.localhost._vm_ip }}"
+    _vm_jump_user: "{{ hostvars.localhost._vm_jump_user }}"
+  tasks:
+    - name: Wait for VM ({{ _vm_vmid }}) SSH port 22 to accept connections from Bastion
+      ansible.builtin.wait_for:
+        host: "{{ _vm_ip }}"
+        port: 22
+        timeout: 180
+        delay: 5
+      when: not ansible_check_mode
+
+    - name: Print VM summary and SSH command
+      ansible.builtin.debug:
+        msg:
+          node: "{{ _target_node }}"
+          vmid: "{{ _vm_vmid | int }}"
+          name: "{{ vm.name }}"
+          profile: "{{ vm.profile }}"
+          os: "{{ vm.os }}"
+          ip: "{{ _vm_ip }}"
+          ssh_via_bastion: "ssh -J {{ _vm_jump_user }}@{{ vmp_gateway.bastion_alias_ip }} {{ vm.ssh_user }}@{{ _vm_ip }}"
+          ssh_direct_lan: "{{ ('ssh ' ~ vm.ssh_user ~ '@' ~ _vm_ip) if vm.profile == 'lan' else 'n/a (private network — use bastion)' }}"
+      when: not ansible_check_mode

@@ -1,0 +1,26 @@
+# Managed by vm-platform — forwarding-only SSH bastion (no shell, no agent forwarding).
+Port {{ vmp_bastion.recipient_port }}
+AddressFamily inet
+ListenAddress {{ vmp_bastion.internal_ip }}
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile /run/vmp-bastion.pid
+UsePAM yes
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+HostbasedAuthentication no
+PermitUserEnvironment no
+StrictModes yes
+AllowGroups vmpjump
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitTunnel no
+PermitTTY no
+AllowTcpForwarding no
+PermitListen none
+LogLevel VERBOSE
+
+Include /etc/vm-platform-bastion/users.d/*.conf

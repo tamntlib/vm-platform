@@ -1,0 +1,282 @@
+---
+# Delete one workload VM cleanly from any node in the cluster without stopping Gateway, Bastion, or other VMs:
+#   Usage: ansible-playbook -i inventory.yml playbooks/delete.yml -e vmid=102
+
+- name: "1/4 Validate target VMID and locate VM across Proxmox cluster"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Validate vmid parameter and block deletion of Gateway/Bastion
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - vmid is defined
+          - (vmid | string) is match('^[0-9]+$')
+          - (vmid | int) != (vmp_gateway.vmid | int)
+          - (vmid | int) != (vmp_bastion.vmid | int)
+          - (vmid | int) >= (vmp_vmid_min | int)
+        fail_msg: "Pass a valid workload vmid (e.g. -e vmid=102). Shared Gateway ({{ vmp_gateway.vmid }}) and Bastion ({{ vmp_bastion.vmid }}) cannot be deleted here."
+      check_mode: false
+
+    - name: Require Proxmox API credentials
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - pve_api_token_id | length > 0
+          - pve_api_token_secret | length > 0
+        fail_msg: "Set VP_API_TOKEN_ID and VP_API_TOKEN_SECRET in environment."
+      check_mode: false
+
+    - name: List existing VMs across the Proxmox cluster
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/resources?type=vm"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _cluster_vms
+      check_mode: false
+      no_log: true
+
+    - name: Locate VM {{ vmid }} in cluster
+      ansible.builtin.set_fact:
+        _del_vmid: "{{ vmid | int }}"
+        _del_jump_user: "vmp-{{ vmid | int }}"
+        _del_vm_row: "{{ (_cluster_vms.json.data | selectattr('vmid', 'equalto', vmid | int) | list | first) | default({}) }}"
+      check_mode: false
+
+    - name: Extract VM existence, node, and name
+      ansible.builtin.set_fact:
+        _del_vm_exists: "{{ (_del_vm_row | length) > 0 }}"
+        _del_vm_node: "{{ _del_vm_row.node | default(pve_primary_node) }}"
+        _del_vm_name: "{{ _del_vm_row.name | default('(absent)') }}"
+      check_mode: false
+
+    - name: Read VM {{ _del_vmid }} config on {{ _del_vm_node }} when present
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _del_vm_node }}/qemu/{{ _del_vmid }}/config"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _del_vm_cfg
+      when: _del_vm_exists | bool
+      check_mode: false
+      no_log: true
+
+    - name: Read cluster workload profile IPSets
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/ipset/{{ item }}"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+        status_code: [200, 400, 404]
+      loop:
+        - vmp_isolated
+        - vmp_internal
+        - vmp_lan
+      register: _del_ipsets
+      check_mode: false
+      no_log: true
+
+    - name: Resolve VM IP
+      ansible.builtin.set_fact:
+        _del_vm_ip: >-
+          {%- set ipcfg = (_del_vm_cfg.json.data.ipconfig0 | default('')) if (_del_vm_exists | bool) else '' -%}
+          {%- if 'ip=' in ipcfg -%}
+            {{ ipcfg.split('ip=')[1].split(',')[0].split('/')[0] }}
+          {%- else -%}
+            {{ '' }}
+          {%- endif -%}
+      check_mode: false
+
+    - name: Collect exact cluster IPSet entries owned by VM {{ _del_vmid }}
+      ansible.builtin.set_fact:
+        _del_ipset_entries: >-
+          {%- set hits = [] -%}
+          {%- for res in _del_ipsets.results -%}
+            {%- if res.status == 200 -%}
+              {%- for row in res.json.data | default([]) -%}
+                {%- set row_ip = row.cidr.split('/')[0] -%}
+                {%- set row_comment = row.comment | default('') -%}
+                {%- if (_del_vm_ip | length > 0 and row_ip == _del_vm_ip) or row_comment.startswith('vm-' ~ (_del_vmid | string) ~ ' ') -%}
+                  {%- set _ = hits.append({'set': res.item, 'cidr': row.cidr}) -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ hits }}
+      check_mode: false
+
+    - name: Preview deletion plan in --check mode (no changes made)
+      ansible.builtin.debug:
+        msg:
+          dry_run: true
+          node: "{{ _del_vm_node }}"
+          vmid: "{{ _del_vmid | int }}"
+          name: "{{ _del_vm_name }}"
+          vm_exists_on_pve: "{{ _del_vm_exists | bool }}"
+          ip: "{{ _del_vm_ip | default('(unknown)', true) }}"
+          ipset_entries_to_remove: "{{ _del_ipset_entries }}"
+          gateway_file: "/etc/vm-platform-gateway/clients.d/vm-{{ _del_vmid }}.nft"
+          bastion_user: "{{ _del_jump_user }}"
+          bastion_files:
+            - "/etc/vm-platform-bastion/users.d/vm-{{ _del_vmid }}.conf"
+            - "/etc/vm-platform-bastion/keys/{{ _del_jump_user }}"
+      when: ansible_check_mode
+
+    - name: Register Gateway and Bastion in dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_connection: ssh
+        ansible_host: "{{ item.host }}"
+        ansible_user: "{{ vmp_admin_user }}"
+        ansible_ssh_private_key_file: "{{ vmp_admin_ssh_private_key_file }}"
+        ansible_ssh_common_args: "{{ item.ssh_args }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_remote_tmp: /tmp/.ansible-vmp
+      loop:
+        - name: vmp_gateway
+          host: "{{ vmp_gateway.lan_ip }}"
+          ssh_args: "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+        - name: vmp_bastion
+          host: "{{ vmp_bastion.internal_ip }}"
+          ssh_args: >-
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+            -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+      when: not ansible_check_mode
+
+- name: "2/4 Remove only this VM's SSH ProxyJump grant on Bastion (no downtime)"
+  hosts: vmp_bastion
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _del_vmid: "{{ hostvars.localhost._del_vmid }}"
+    _del_jump_user: "{{ hostvars.localhost._del_jump_user }}"
+  tasks:
+    - name: Remove per-VM Bastion Match config and public key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/etc/vm-platform-bastion/users.d/vm-{{ _del_vmid }}.conf"
+        - "/etc/vm-platform-bastion/keys/{{ _del_jump_user }}"
+      register: _bastion_removed
+      when: not ansible_check_mode
+
+    - name: Validate Bastion sshd_config before reload
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -t, -f, /etc/vm-platform-bastion/sshd_config]
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - _bastion_removed.changed
+
+    - name: Reload vmp-bastion.service (SIGHUP — preserves other VMs' sessions)
+      ansible.builtin.systemd_service:
+        name: vmp-bastion.service
+        state: reloaded
+      when:
+        - not ansible_check_mode
+        - _bastion_removed.changed
+
+    - name: Remove forwarding-only jump user {{ _del_jump_user }}
+      ansible.builtin.user:
+        name: "{{ _del_jump_user }}"
+        state: absent
+        force: true
+      when: not ansible_check_mode
+
+- name: "3/4 Remove only this VM's DNS/route grant on Gateway (no downtime)"
+  hosts: vmp_gateway
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _del_vmid: "{{ hostvars.localhost._del_vmid }}"
+  tasks:
+    - name: Remove per-VM Gateway nftables drop-in
+      ansible.builtin.file:
+        path: "/etc/vm-platform-gateway/clients.d/vm-{{ _del_vmid }}.nft"
+        state: absent
+      register: _gw_removed
+      when: not ansible_check_mode
+
+    - name: Validate Gateway nftables ruleset before reload
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, -c, -f, /etc/vm-platform-gateway/gateway.nft]
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - _gw_removed.changed
+
+    - name: Reload vmp-gateway.service (atomic nftables reload)
+      ansible.builtin.systemd_service:
+        name: vmp-gateway.service
+        state: reloaded
+      when:
+        - not ansible_check_mode
+        - _gw_removed.changed
+
+- name: "4/4 Remove IP from cluster IPSet and delete VM + disk on Proxmox"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_port: "{{ pve_api_port }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_validate_certs }}"
+      ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+  tasks:
+    - name: Remove VM IP from cluster firewall IPSet
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/ipset/{{ item.set }}/{{ item.cidr | urlencode | replace('/', '%2F') }}"
+        method: DELETE
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: [200]
+      loop: "{{ _del_ipset_entries }}"
+      when: not ansible_check_mode
+      no_log: true
+
+    - name: Stop and purge VM {{ _del_vmid }} on {{ _del_vm_node }} (including disks)
+      community.proxmox.proxmox_kvm:
+        node: "{{ _del_vm_node }}"
+        vmid: "{{ _del_vmid | int }}"
+        state: absent
+        force: true
+        purge: true
+        timeout: 60
+      when:
+        - not ansible_check_mode
+        - _del_vm_exists | bool
+
+    - name: Print deletion summary
+      ansible.builtin.debug:
+        msg:
+          deleted_node: "{{ _del_vm_node }}"
+          deleted_vmid: "{{ _del_vmid | int }}"
+          deleted_name: "{{ _del_vm_name }}"
+          removed_ipset_entries: "{{ _del_ipset_entries }}"
+      when: not ansible_check_mode

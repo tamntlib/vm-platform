@@ -1,0 +1,50 @@
+services:
+  tools:
+    image: vm-platform-controller:tools
+    cpus: 2
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 128
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /run/work:rw,nosuid,nodev,size=268435456,mode=1777
+    volumes:
+      - ./ansible:/workspace/ansible:ro
+      - ./tests:/workspace/tests:ro
+      - ./README.md:/workspace/README.md:ro
+      - ./compose.yaml:/workspace/compose.yaml:ro
+    working_dir: /workspace
+    command: [python, -m, pytest, -q, -p, no:cacheprovider, /workspace/tests]
+
+  controller:
+    image: vm-platform-controller:runtime
+    cpus: 1
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      - VP_NODE
+      - VP_API_HOST
+      - VP_API_PORT
+      - VP_API_USER
+      - VP_API_TOKEN_ID
+      - VP_API_TOKEN_SECRET
+      - VP_API_CA_FILE
+      - VP_API_VALIDATE_CERTS
+      - ANSIBLE_HOST_KEY_CHECKING=True
+      - ANSIBLE_SSH_CONTROL_PATH_DIR=/run/work/ssh-control
+    tmpfs:
+      - /run/work:rw,nosuid,nodev,size=134217728,mode=1777
+    volumes:
+      - ./ansible:/workspace/ansible:ro
+      - ./.local/controller/input:/input:ro
+      - ./.local/controller/state:/state
+      - ./.local/controller/auth:/auth:ro
+    working_dir: /workspace/ansible
+    command: [ansible-playbook, -i, /input/inventory.yml, playbooks/init.yml]

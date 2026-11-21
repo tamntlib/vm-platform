@@ -1,0 +1,6 @@
+**
+!controller/
+!controller/**
+!ansible/
+ansible/**
+!ansible/requirements.yml

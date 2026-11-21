@@ -1,0 +1,887 @@
+---
+# One-time (and multi-node idempotent) platform initialization:
+#   1. Private Linux bridges + VXLAN (internal, isolated) + host L2/IPv6 guard on every node in proxmox_nodes
+#   2. Proxmox cluster firewall IPSets + Security Groups (vmp_isolated, vmp_internal, vmp_lan)
+#   3. One shared Debian Gateway VM (vmid 100) + OpenSSH Bastion VM (vmid 101) for the cluster
+# Safe to re-run when adding a new node to proxmox_nodes in inventory.yml.
+
+- name: "1/5 Prepare private networks and host guard on all Proxmox cluster nodes"
+  hosts: proxmox_nodes
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Verify existing management bridge is present before making changes
+      ansible.builtin.command:
+        argv: [/usr/sbin/ip, -4, -o, addr, show, dev, "{{ vmp_lan_bridge }}"]
+      register: mgmt_check
+      changed_when: false
+      check_mode: false
+      failed_when: mgmt_check.rc != 0 or (ansible_host ~ '/') not in mgmt_check.stdout
+
+    - name: Ensure /etc/network/interfaces sources interfaces.d
+      ansible.builtin.lineinfile:
+        path: /etc/network/interfaces
+        line: "source /etc/network/interfaces.d/*"
+        state: present
+
+    - name: Render private network interface definitions (never touches management bridge)
+      ansible.builtin.template:
+        src: templates/private-networks.j2
+        dest: /etc/network/interfaces.d/vmp-networks
+        owner: root
+        group: root
+        mode: "0644"
+      register: private_net_file
+
+    - name: Inspect current network links on Proxmox node
+      ansible.builtin.command:
+        argv: [/usr/sbin/ip, -j, link, show]
+      register: node_links_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Bring up missing private VXLAN and bridge interfaces individually (never ifreload -a)
+      ansible.builtin.command:
+        argv: [/usr/sbin/ifup, "{{ item }}"]
+      loop:
+        - "{{ vmp_networks.internal.vxlan }}"
+        - "{{ vmp_networks.internal.bridge }}"
+        - "{{ vmp_networks.isolated.vxlan }}"
+        - "{{ vmp_networks.isolated.bridge }}"
+      when:
+        - not ansible_check_mode
+        - item not in (node_links_raw.stdout | from_json | map(attribute='ifname') | list)
+
+    - name: Reload only our VXLAN interfaces if peer list changed on an existing node
+      ansible.builtin.command:
+        argv: [/usr/sbin/ifreload, "{{ vmp_networks.internal.vxlan }}", "{{ vmp_networks.isolated.vxlan }}"]
+      when:
+        - not ansible_check_mode
+        - private_net_file.changed
+        - vmp_networks.internal.vxlan in (node_links_raw.stdout | from_json | map(attribute='ifname') | list)
+        - vmp_networks.isolated.vxlan in (node_links_raw.stdout | from_json | map(attribute='ifname') | list)
+
+    - name: Ensure private bridge MTU matches VXLAN MTU
+      ansible.builtin.command:
+        argv: [/usr/sbin/ip, link, set, dev, "{{ item.bridge }}", mtu, "{{ item.mtu }}"]
+      loop:
+        - "{{ vmp_networks.internal }}"
+        - "{{ vmp_networks.isolated }}"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Ensure /etc/nftables.d directory exists
+      ansible.builtin.file:
+        path: /etc/nftables.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Render supplemental host bridge nftables guard for private bridges
+      ansible.builtin.template:
+        src: templates/host-guard.nft.j2
+        dest: /etc/nftables.d/vmp-guard.nft
+        owner: root
+        group: root
+        mode: "0644"
+      register: host_guard_file
+
+    - name: Validate host bridge guard syntax
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, -c, -f, /etc/nftables.d/vmp-guard.nft]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Install systemd unit to persist host bridge guard across reboots
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vmp-host-guard.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=vm-platform host L2/IPv6 guard for private bridges
+          After=network-online.target pve-firewall.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/nft -f /etc/nftables.d/vmp-guard.nft
+          ExecReload=/usr/sbin/nft -f /etc/nftables.d/vmp-guard.nft
+
+          [Install]
+          WantedBy=multi-user.target
+      register: host_guard_unit
+
+    - name: Enable and apply host bridge guard
+      ansible.builtin.systemd_service:
+        name: vmp-host-guard.service
+        enabled: true
+        state: "{{ 'restarted' if (host_guard_file.changed or host_guard_unit.changed) else 'started' }}"
+        daemon_reload: true
+      when: not ansible_check_mode
+
+- name: "2/5 Configure Proxmox cluster firewall IPSets and Security Groups"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_port: "{{ pve_api_port }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_validate_certs }}"
+      ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+  tasks:
+    - name: Require at least one Proxmox node and API credentials
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (groups['proxmox_nodes'] | default([]) | length) >= 1
+          - pve_api_token_id | length > 0
+          - pve_api_token_secret | length > 0
+        fail_msg: "Configure proxmox_nodes in inventory.yml and export VP_API_TOKEN_ID / VP_API_TOKEN_SECRET."
+      check_mode: false
+
+    - name: Verify Proxmox cluster firewall is enabled
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/options"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: cluster_fw_opts
+      check_mode: false
+      no_log: true
+
+    - name: Assert cluster firewall is enabled before creating policy
+      ansible.builtin.assert:
+        quiet: true
+        that: (cluster_fw_opts.json.data.enable | default(0) | int) == 1
+        fail_msg: "Proxmox Datacenter Firewall is disabled; enable it before running init.yml."
+      check_mode: false
+
+    - name: Read existing cluster IPSets
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/ipset"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: existing_ipsets
+      check_mode: false
+      no_log: true
+
+    - name: Build protected IPSet entries covering router, all cluster nodes, Gateway, and Bastion
+      ansible.builtin.set_fact:
+        _protected_ipset_cidrs: >-
+          {%- set cidrs = [
+            vmp_lan_gateway ~ '/32',
+            vmp_gateway.lan_ip ~ '/32',
+            vmp_gateway.bastion_alias_ip ~ '/32',
+            vmp_networks.internal.gateway ~ '/32',
+            vmp_networks.internal.bastion ~ '/32',
+            vmp_networks.isolated.gateway ~ '/32',
+            vmp_networks.isolated.bastion ~ '/32'
+          ] -%}
+          {%- for n in groups['proxmox_nodes'] -%}
+            {%- set _ = cidrs.append(hostvars[n].ansible_host ~ '/32') -%}
+          {%- endfor -%}
+          {%- for extra in vmp_extra_protected_cidrs | default([]) -%}
+            {%- set _ = cidrs.append(extra) -%}
+          {%- endfor -%}
+          {%- set out = [] -%}
+          {%- for c in cidrs | unique | sort -%}
+            {%- set _ = out.append({'cidr': c}) -%}
+          {%- endfor -%}
+          {{ out }}
+      check_mode: false
+
+    - name: Ensure protected and company cluster IPSets exist with current members
+      community.proxmox.proxmox_firewall:
+        level: cluster
+        update: true
+        state: present
+        ip_sets:
+          - name: vmp_protected
+            comment: "vm-platform protected infrastructure and management"
+            cidrs: "{{ _protected_ipset_cidrs }}"
+          - name: vmp_company
+            comment: "vm-platform company LAN"
+            cidrs:
+              - cidr: "{{ vmp_lan_cidr }}"
+      when: not ansible_check_mode
+
+    - name: Create empty workload profile IPSets when absent (never wipes existing members)
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/firewall/ipset"
+        method: POST
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          name: "{{ item }}"
+          comment: "vm-platform workload profile members"
+        status_code: [200]
+      loop:
+        - vmp_isolated
+        - vmp_internal
+        - vmp_lan
+      when:
+        - not ansible_check_mode
+        - item not in (existing_ipsets.json.data | map(attribute='name') | list)
+      no_log: true
+
+    - name: Build ordered Security Group rules for the three network profiles
+      ansible.builtin.set_fact:
+        _non_internet_drops: >-
+          {%- set out = [] -%}
+          {%- for cidr in vmp_non_internet_cidrs -%}
+            {%- set _ = out.append({'type': 'out', 'action': 'DROP', 'dest': cidr, 'enabled': true}) -%}
+          {%- endfor -%}
+          {{ out }}
+        _base_prot_drops:
+          - { type: in,  action: DROP, source: "+dc/vmp_protected", enabled: true }
+          - { type: out, action: DROP, dest:   "+dc/vmp_protected", enabled: true }
+          - { type: out, action: DROP, proto: udp, dport: "4789", enabled: true }
+        _private_subnet_drops:
+          - { type: in,  action: DROP, source: "{{ vmp_networks.internal.cidr }}", enabled: true }
+          - { type: out, action: DROP, dest:   "{{ vmp_networks.internal.cidr }}", enabled: true }
+          - { type: in,  action: DROP, source: "{{ vmp_networks.isolated.cidr }}", enabled: true }
+          - { type: out, action: DROP, dest:   "{{ vmp_networks.isolated.cidr }}", enabled: true }
+
+    - name: Apply Security Group vmp_isolated (deny all peers and company LAN in both directions)
+      ansible.builtin.include_tasks: tasks/pve-security-group.yml
+      vars:
+        sg_name: vmp_isolated
+        sg_rules: >-
+          {{
+            _base_prot_drops
+            + [
+              {'type': 'in',  'action': 'DROP', 'source': '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'out', 'action': 'DROP', 'dest':   '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'in',  'action': 'DROP', 'source': '+dc/vmp_internal', 'enabled': true},
+              {'type': 'out', 'action': 'DROP', 'dest':   '+dc/vmp_internal', 'enabled': true},
+              {'type': 'in',  'action': 'DROP', 'source': '+dc/vmp_lan',      'enabled': true},
+              {'type': 'out', 'action': 'DROP', 'dest':   '+dc/vmp_lan',      'enabled': true},
+              {'type': 'in',  'action': 'DROP', 'source': '+dc/vmp_company',  'enabled': true},
+              {'type': 'out', 'action': 'DROP', 'dest':   '+dc/vmp_company',  'enabled': true}
+            ]
+            + _private_subnet_drops
+            + _non_internet_drops
+          }}
+
+    - name: Apply Security Group vmp_internal (allow only internal peers; deny isolated, lan, company LAN)
+      ansible.builtin.include_tasks: tasks/pve-security-group.yml
+      vars:
+        sg_name: vmp_internal
+        sg_rules: >-
+          {{
+            _base_prot_drops
+            + [
+              {'type': 'in',  'action': 'DROP',   'source': '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'out', 'action': 'DROP',   'dest':   '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'in',  'action': 'DROP',   'source': '+dc/vmp_lan',      'enabled': true},
+              {'type': 'out', 'action': 'DROP',   'dest':   '+dc/vmp_lan',      'enabled': true},
+              {'type': 'in',  'action': 'DROP',   'source': '+dc/vmp_company',  'enabled': true},
+              {'type': 'out', 'action': 'DROP',   'dest':   '+dc/vmp_company',  'enabled': true},
+              {'type': 'in',  'action': 'ACCEPT', 'source': '+dc/vmp_internal', 'enabled': true},
+              {'type': 'out', 'action': 'ACCEPT', 'dest':   '+dc/vmp_internal', 'enabled': true}
+            ]
+            + _private_subnet_drops
+            + _non_internet_drops
+          }}
+
+    - name: Apply Security Group vmp_lan (allow lan peers and company LAN; deny protected, isolated, internal)
+      ansible.builtin.include_tasks: tasks/pve-security-group.yml
+      vars:
+        sg_name: vmp_lan
+        sg_rules: >-
+          {{
+            _base_prot_drops
+            + [
+              {'type': 'in',  'action': 'DROP',   'source': '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'out', 'action': 'DROP',   'dest':   '+dc/vmp_isolated', 'enabled': true},
+              {'type': 'in',  'action': 'DROP',   'source': '+dc/vmp_internal', 'enabled': true},
+              {'type': 'out', 'action': 'DROP',   'dest':   '+dc/vmp_internal', 'enabled': true},
+              {'type': 'in',  'action': 'ACCEPT', 'source': '+dc/vmp_lan',      'enabled': true},
+              {'type': 'out', 'action': 'ACCEPT', 'dest':   '+dc/vmp_lan',      'enabled': true},
+              {'type': 'in',  'action': 'ACCEPT', 'source': '+dc/vmp_company',  'enabled': true},
+              {'type': 'out', 'action': 'ACCEPT', 'dest':   '+dc/vmp_company',  'enabled': true}
+            ]
+            + _private_subnet_drops
+            + _non_internet_drops
+          }}
+
+- name: "3/5 Provision single shared Gateway and Bastion VMs for the cluster"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_port: "{{ pve_api_port }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_validate_certs }}"
+      ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+  tasks:
+    - name: Read administrator SSH public key
+      ansible.builtin.set_fact:
+        _admin_pubkey: "{{ lookup('ansible.builtin.file', vmp_admin_ssh_public_key_file) | trim }}"
+      check_mode: false
+
+    - name: List existing VMs across the entire Proxmox cluster
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/resources?type=vm"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: cluster_vms
+      check_mode: false
+      no_log: true
+
+    - name: Locate existing Gateway and Bastion across the cluster
+      ansible.builtin.set_fact:
+        _gw_row: "{{ (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_gateway.vmid | int) | list | first) | default({}) }}"
+        _bastion_row: "{{ (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_bastion.vmid | int) | list | first) | default({}) }}"
+      check_mode: false
+
+    - name: Resolve Gateway/Bastion presence and host nodes
+      ansible.builtin.set_fact:
+        _gw_exists: "{{ (_gw_row | length) > 0 }}"
+        _gw_node: "{{ _gw_row.node | default(pve_primary_node) }}"
+        _bastion_exists: "{{ (_bastion_row | length) > 0 }}"
+        _bastion_node: "{{ _bastion_row.node | default(pve_primary_node) }}"
+      check_mode: false
+
+    - name: Verify Gateway/Bastion cloud image exists on {{ pve_primary_node }} when creating either VM
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ pve_primary_node }}/storage/{{ vmp_image_storage }}/content?content=import"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: import_contents
+      when: (not _gw_exists) or (not _bastion_exists)
+      check_mode: false
+      no_log: true
+
+    - name: Assert gateway/bastion OS image is present
+      ansible.builtin.assert:
+        quiet: true
+        that: vmp_os_catalog[vmp_gateway.os].volume in (import_contents.json.data | map(attribute='volid') | list)
+        fail_msg: "Cloud image {{ vmp_os_catalog[vmp_gateway.os].volume }} not found on {{ pve_primary_node }}:{{ vmp_image_storage }}."
+      when: (not _gw_exists) or (not _bastion_exists)
+      check_mode: false
+
+    - name: Create Gateway VM ({{ vmp_gateway.vmid }}) on {{ pve_primary_node }}/{{ vmp_vm_storage }} when absent
+      community.proxmox.proxmox_kvm:
+        node: "{{ pve_primary_node }}"
+        vmid: "{{ vmp_gateway.vmid }}"
+        name: "{{ vmp_gateway.name }}"
+        description: "vm-platform shared gateway"
+        cores: "{{ vmp_gateway.cores }}"
+        memory: "{{ vmp_gateway.memory_mib }}"
+        cpu: host
+        scsihw: virtio-scsi-single
+        scsi:
+          scsi0: "{{ vmp_vm_storage }}:0,import-from={{ vmp_os_catalog[vmp_gateway.os].volume }}"
+        ide:
+          ide2: "{{ vmp_vm_storage }}:cloudinit"
+        net:
+          net0: "virtio={{ vmp_gateway.lan_mac }},bridge={{ vmp_lan_bridge }},firewall=1,mtu={{ vmp_lan_mtu }}"
+          net1: "virtio={{ vmp_gateway.internal_mac }},bridge={{ vmp_networks.internal.bridge }},firewall=1,mtu={{ vmp_networks.internal.mtu }}"
+          net2: "virtio={{ vmp_gateway.isolated_mac }},bridge={{ vmp_networks.isolated.bridge }},firewall=1,mtu={{ vmp_networks.isolated.mtu }}"
+        ipconfig:
+          ipconfig0: "ip={{ vmp_gateway.lan_ip }}/{{ vmp_networks.lan.prefixlen }},gw={{ vmp_lan_gateway }}"
+          ipconfig1: "ip={{ vmp_networks.internal.gateway }}/{{ vmp_networks.internal.prefixlen }}"
+          ipconfig2: "ip={{ vmp_networks.isolated.gateway }}/{{ vmp_networks.isolated.prefixlen }}"
+        nameservers: "{{ vmp_dns_upstreams }}"
+        ciuser: "{{ vmp_admin_user }}"
+        sshkeys: "{{ _admin_pubkey }}"
+        ciupgrade: false
+        onboot: true
+        boot: order=scsi0
+        serial:
+          serial0: socket
+        vga: serial0
+        agent: "yes"
+        timeout: 180
+        state: present
+      when:
+        - not ansible_check_mode
+        - not _gw_exists
+
+    - name: Resize Gateway disk to {{ vmp_gateway.disk_gib }}G
+      community.proxmox.proxmox_disk:
+        vmid: "{{ vmp_gateway.vmid }}"
+        disk: scsi0
+        size: "{{ vmp_gateway.disk_gib }}G"
+        state: resized
+      when:
+        - not ansible_check_mode
+        - not _gw_exists
+
+    - name: Build Gateway non-Internet egress DROP rules
+      ansible.builtin.set_fact:
+        _gw_non_internet_drops: >-
+          {%- set out = [] -%}
+          {%- for c in vmp_non_internet_cidrs -%}
+            {%- set _ = out.append({'type': 'out', 'action': 'DROP', 'iface': 'net0', 'dest': c, 'enable': 1}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Apply PVE Firewall to Gateway VM ({{ vmp_gateway.vmid }}) before boot
+      ansible.builtin.include_tasks: tasks/pve-vm-firewall.yml
+      vars:
+        fw_node: "{{ _gw_node }}"
+        fw_vmid: "{{ vmp_gateway.vmid }}"
+        fw_ip_sets: []
+        fw_options:
+          enable: 1
+          dhcp: 0
+          ndp: 0
+          radv: 0
+          ipfilter: 0
+          macfilter: 1
+          policy_in: DROP
+          policy_out: DROP
+        fw_rules: >-
+          {{
+            [
+              {'type': 'in',  'action': 'DROP',   'source': '::/0', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest':   '::/0', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_lan_cidr, 'dest': vmp_gateway.lan_ip ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_lan_cidr, 'dest': vmp_gateway.bastion_alias_ip ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_networks.internal.gateway ~ '/32', 'dest': vmp_bastion.internal_ip ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_networks.internal.gateway ~ '/32', 'dest': vmp_bastion.internal_ip ~ '/32', 'proto': 'tcp', 'dport': (vmp_bastion.recipient_port | string), 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': '+dc/vmp_internal', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': '+dc/vmp_internal', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'dest': vmp_networks.isolated.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'dest': vmp_networks.isolated.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_bastion.internal_ip ~ '/32', 'dest': '+dc/vmp_lan', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_gateway.bastion_alias_ip ~ '/32', 'dest': '+dc/vmp_lan', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'in',  'action': 'DROP',   'iface': 'net1', 'dest': '+dc/vmp_protected', 'enable': 1},
+              {'type': 'in',  'action': 'DROP',   'iface': 'net2', 'dest': '+dc/vmp_protected', 'enable': 1},
+              {'type': 'in',  'action': 'DROP',   'iface': 'net1', 'dest': '+dc/vmp_company', 'enable': 1},
+              {'type': 'in',  'action': 'DROP',   'iface': 'net2', 'dest': '+dc/vmp_company', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': '+dc/vmp_internal', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'iface': 'net0', 'dest': '+dc/vmp_protected', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'iface': 'net0', 'dest': '+dc/vmp_company', 'enable': 1}
+            ]
+            + _gw_non_internet_drops
+            + [
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_gateway.lan_ip ~ '/32', 'dest': '0.0.0.0/0', 'enable': 1}
+            ]
+          }}
+
+    - name: Start Gateway VM ({{ vmp_gateway.vmid }})
+      community.proxmox.proxmox_kvm:
+        node: "{{ _gw_node }}"
+        vmid: "{{ vmp_gateway.vmid }}"
+        state: started
+      when: not ansible_check_mode
+
+    - name: Create Bastion VM ({{ vmp_bastion.vmid }}) on {{ pve_primary_node }}/{{ vmp_vm_storage }} when absent
+      community.proxmox.proxmox_kvm:
+        node: "{{ pve_primary_node }}"
+        vmid: "{{ vmp_bastion.vmid }}"
+        name: "{{ vmp_bastion.name }}"
+        description: "vm-platform shared bastion"
+        cores: "{{ vmp_bastion.cores }}"
+        memory: "{{ vmp_bastion.memory_mib }}"
+        cpu: host
+        scsihw: virtio-scsi-single
+        scsi:
+          scsi0: "{{ vmp_vm_storage }}:0,import-from={{ vmp_os_catalog[vmp_bastion.os].volume }}"
+        ide:
+          ide2: "{{ vmp_vm_storage }}:cloudinit"
+        net:
+          net0: "virtio={{ vmp_bastion.internal_mac }},bridge={{ vmp_networks.internal.bridge }},firewall=1,mtu={{ vmp_networks.internal.mtu }}"
+          net1: "virtio={{ vmp_bastion.isolated_mac }},bridge={{ vmp_networks.isolated.bridge }},firewall=1,mtu={{ vmp_networks.isolated.mtu }}"
+        ipconfig:
+          ipconfig0: "ip={{ vmp_bastion.internal_ip }}/{{ vmp_networks.internal.prefixlen }},gw={{ vmp_networks.internal.gateway }}"
+          ipconfig1: "ip={{ vmp_bastion.isolated_ip }}/{{ vmp_networks.isolated.prefixlen }}"
+        nameservers:
+          - "{{ vmp_networks.internal.gateway }}"
+        ciuser: "{{ vmp_admin_user }}"
+        sshkeys: "{{ _admin_pubkey }}"
+        ciupgrade: false
+        onboot: true
+        boot: order=scsi0
+        serial:
+          serial0: socket
+        vga: serial0
+        agent: "yes"
+        timeout: 180
+        state: present
+      when:
+        - not ansible_check_mode
+        - not _bastion_exists
+
+    - name: Resize Bastion disk to {{ vmp_bastion.disk_gib }}G
+      community.proxmox.proxmox_disk:
+        vmid: "{{ vmp_bastion.vmid }}"
+        disk: scsi0
+        size: "{{ vmp_bastion.disk_gib }}G"
+        state: resized
+      when:
+        - not ansible_check_mode
+        - not _bastion_exists
+
+    - name: Apply PVE Firewall to Bastion VM ({{ vmp_bastion.vmid }}) before boot
+      ansible.builtin.include_tasks: tasks/pve-vm-firewall.yml
+      vars:
+        fw_node: "{{ _bastion_node }}"
+        fw_vmid: "{{ vmp_bastion.vmid }}"
+        fw_ip_sets:
+          - name: ipfilter-net0
+            cidrs:
+              - cidr: "{{ vmp_bastion.internal_ip }}/32"
+          - name: ipfilter-net1
+            cidrs:
+              - cidr: "{{ vmp_bastion.isolated_ip }}/32"
+        fw_options:
+          enable: 1
+          dhcp: 0
+          ndp: 0
+          radv: 0
+          ipfilter: 1
+          macfilter: 1
+          policy_in: DROP
+          policy_out: DROP
+        fw_rules:
+          - { type: in,  action: DROP,   source: "::/0", enable: 1 }
+          - { type: out, action: DROP,   dest:   "::/0", enable: 1 }
+          - { type: in,  action: ACCEPT, iface: net0, source: "{{ vmp_networks.internal.gateway }}/32", dest: "{{ vmp_bastion.internal_ip }}/32", proto: tcp, dport: "22", enable: 1 }
+          - { type: in,  action: ACCEPT, iface: net0, source: "{{ vmp_networks.internal.gateway }}/32", dest: "{{ vmp_bastion.internal_ip }}/32", proto: tcp, dport: "{{ vmp_bastion.recipient_port }}", enable: 1 }
+          - { type: out, action: ACCEPT, iface: net0, source: "{{ vmp_bastion.internal_ip }}/32", dest: "+dc/vmp_internal", proto: tcp, dport: "22", enable: 1 }
+          - { type: out, action: ACCEPT, iface: net1, source: "{{ vmp_bastion.isolated_ip }}/32", dest: "+dc/vmp_isolated", proto: tcp, dport: "22", enable: 1 }
+          - { type: out, action: ACCEPT, iface: net0, source: "{{ vmp_bastion.internal_ip }}/32", dest: "+dc/vmp_lan", proto: tcp, dport: "22", enable: 1 }
+
+    - name: Start Bastion VM ({{ vmp_bastion.vmid }})
+      community.proxmox.proxmox_kvm:
+        node: "{{ _bastion_node }}"
+        vmid: "{{ vmp_bastion.vmid }}"
+        state: started
+      when: not ansible_check_mode
+
+    - name: Wait for Gateway SSH ({{ vmp_gateway.lan_ip }}:22) to come up
+      ansible.builtin.wait_for:
+        host: "{{ vmp_gateway.lan_ip }}"
+        port: 22
+        timeout: 180
+        delay: 5
+      when: not ansible_check_mode
+
+    - name: Register Gateway and Bastion in dynamic Ansible inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_connection: ssh
+        ansible_host: "{{ item.host }}"
+        ansible_user: "{{ vmp_admin_user }}"
+        ansible_ssh_private_key_file: "{{ vmp_admin_ssh_private_key_file }}"
+        ansible_ssh_common_args: "{{ item.ssh_args }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_remote_tmp: /tmp/.ansible-vmp
+      loop:
+        - name: vmp_gateway
+          host: "{{ vmp_gateway.lan_ip }}"
+          ssh_args: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+        - name: vmp_bastion
+          host: "{{ vmp_bastion.internal_ip }}"
+          ssh_args: >-
+            -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+            -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+      when: not ansible_check_mode
+
+- name: "4/5 Configure Debian Gateway (routing, nftables, DNS)"
+  hosts: vmp_gateway
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Wait for Gateway SSH login readiness
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+      when: not ansible_check_mode
+
+    - name: Wait for Cloud-init to finish on Gateway
+      ansible.builtin.command:
+        argv: [/usr/bin/cloud-init, status, --wait]
+      register: gw_ci
+      changed_when: false
+      failed_when: gw_ci.rc not in [0, 2]
+      when: not ansible_check_mode
+
+    - name: Discover actual Gateway network interface names by MAC
+      ansible.builtin.command:
+        argv: [/usr/sbin/ip, -j, link, show]
+      register: gw_links_raw
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Map Gateway MAC addresses to Linux interface names
+      ansible.builtin.set_fact:
+        gw_lan_iface: "{{ (gw_links_raw.stdout | from_json | selectattr('address', 'defined') | selectattr('address', 'equalto', vmp_gateway.lan_mac | lower) | first).ifname }}"
+        gw_int_iface: "{{ (gw_links_raw.stdout | from_json | selectattr('address', 'defined') | selectattr('address', 'equalto', vmp_gateway.internal_mac | lower) | first).ifname }}"
+        gw_iso_iface: "{{ (gw_links_raw.stdout | from_json | selectattr('address', 'defined') | selectattr('address', 'equalto', vmp_gateway.isolated_mac | lower) | first).ifname }}"
+      when: not ansible_check_mode
+
+    - name: Check if nftables and dnsmasq are already installed
+      ansible.builtin.command:
+        argv: [/usr/bin/dpkg, -s, nftables, dnsmasq]
+      register: gw_pkgs
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Install nftables and dnsmasq on Gateway when absent
+      ansible.builtin.apt:
+        name:
+          - nftables
+          - dnsmasq
+        state: present
+        update_cache: true
+        install_recommends: false
+      when:
+        - not ansible_check_mode
+        - gw_pkgs.rc != 0
+
+    - name: Enable IPv4 forwarding and disable IPv6 on Gateway
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-vmp-gateway.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+      register: gw_sysctl
+      when: not ansible_check_mode
+
+    - name: Apply Gateway sysctl settings
+      ansible.builtin.command:
+        argv: [/usr/sbin/sysctl, --system]
+      when:
+        - not ansible_check_mode
+        - gw_sysctl.changed
+
+    - name: Create Gateway config and per-VM client drop-in directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /etc/vm-platform-gateway
+        - /etc/vm-platform-gateway/clients.d
+      when: not ansible_check_mode
+
+    - name: Ensure clients.d has a baseline placeholder file (preserves existing VM files)
+      ansible.builtin.copy:
+        dest: /etc/vm-platform-gateway/clients.d/00-empty.nft
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+        content: "# Per-VM rules are managed by create.yml\n"
+      when: not ansible_check_mode
+
+    - name: Render Gateway nftables ruleset
+      ansible.builtin.template:
+        src: templates/gateway-nftables.conf.j2
+        dest: /etc/vm-platform-gateway/gateway.nft
+        owner: root
+        group: root
+        mode: "0644"
+      register: gw_nft_file
+      when: not ansible_check_mode
+
+    - name: Validate Gateway nftables ruleset
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, -c, -f, /etc/vm-platform-gateway/gateway.nft]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Disable default vendor nftables service
+      ansible.builtin.systemd_service:
+        name: nftables.service
+        enabled: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Install systemd unit for Gateway alias IP and nftables
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vmp-gateway.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=vm-platform gateway alias IP and nftables
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/ip addr replace {{ vmp_gateway.bastion_alias_ip }}/32 dev {{ gw_lan_iface }}
+          ExecStart=/usr/sbin/nft -f /etc/vm-platform-gateway/gateway.nft
+          ExecReload=/usr/sbin/nft -f /etc/vm-platform-gateway/gateway.nft
+
+          [Install]
+          WantedBy=multi-user.target
+      register: gw_unit
+      when: not ansible_check_mode
+
+    - name: Enable and start vmp-gateway.service (async in case first nf_conntrack load resets SSH)
+      ansible.builtin.systemd_service:
+        name: vmp-gateway.service
+        enabled: true
+        state: "{{ 'restarted' if (gw_nft_file.changed or gw_unit.changed) else 'started' }}"
+        daemon_reload: true
+      async: 30
+      poll: 0
+      when: not ansible_check_mode
+
+    - name: Reset SSH connection and verify Gateway remains reachable after firewall load
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for Gateway SSH after vmp-gateway.service activation
+      ansible.builtin.wait_for_connection:
+        timeout: 60
+      when: not ansible_check_mode
+
+    - name: Verify vmp-gateway.service is active
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, is-active, vmp-gateway.service]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Configure dnsmasq for private network DNS forwarding
+      ansible.builtin.template:
+        src: templates/gateway-dnsmasq.conf.j2
+        dest: /etc/dnsmasq.d/vmp-dns.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: gw_dns_cfg
+      when: not ansible_check_mode
+
+    - name: Ensure dnsmasq is enabled and running
+      ansible.builtin.systemd_service:
+        name: dnsmasq.service
+        enabled: true
+        state: "{{ 'restarted' if gw_dns_cfg.changed else 'started' }}"
+      when: not ansible_check_mode
+
+- name: "5/5 Configure OpenSSH Bastion (forwarding-only ProxyJump)"
+  hosts: vmp_bastion
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Wait for Bastion SSH via Gateway ProxyJump
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+      when: not ansible_check_mode
+
+    - name: Wait for Cloud-init to finish on Bastion
+      ansible.builtin.command:
+        argv: [/usr/bin/cloud-init, status, --wait]
+      register: bastion_ci
+      changed_when: false
+      failed_when: bastion_ci.rc not in [0, 2]
+      when: not ansible_check_mode
+
+    - name: Ensure vmpjump system group exists
+      ansible.builtin.group:
+        name: vmpjump
+        system: true
+      when: not ansible_check_mode
+
+    - name: Create Bastion config, key, and per-VM drop-in directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /etc/vm-platform-bastion
+        - /etc/vm-platform-bastion/keys
+        - /etc/vm-platform-bastion/users.d
+      when: not ansible_check_mode
+
+    - name: Ensure users.d has a baseline placeholder file (preserves existing VM grants)
+      ansible.builtin.copy:
+        dest: /etc/vm-platform-bastion/users.d/00-empty.conf
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+        content: "# Per-VM jump users are managed by create.yml\n"
+      when: not ansible_check_mode
+
+    - name: Render dedicated Bastion sshd_config
+      ansible.builtin.template:
+        src: templates/bastion-sshd.conf.j2
+        dest: /etc/vm-platform-bastion/sshd_config
+        owner: root
+        group: root
+        mode: "0600"
+      register: bastion_sshd_cfg
+      when: not ansible_check_mode
+
+    - name: Validate Bastion sshd_config
+      ansible.builtin.command:
+        argv: [/usr/sbin/sshd, -t, -f, /etc/vm-platform-bastion/sshd_config]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Install systemd unit for dedicated Bastion sshd
+      ansible.builtin.template:
+        src: templates/bastion-service.j2
+        dest: /etc/systemd/system/vmp-bastion.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: bastion_unit
+      when: not ansible_check_mode
+
+    - name: Enable and start vmp-bastion.service
+      ansible.builtin.systemd_service:
+        name: vmp-bastion.service
+        enabled: true
+        state: "{{ 'restarted' if (bastion_sshd_cfg.changed or bastion_unit.changed) else 'started' }}"
+        daemon_reload: true
+      when: not ansible_check_mode

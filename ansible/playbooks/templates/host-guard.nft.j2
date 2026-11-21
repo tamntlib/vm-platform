@@ -1,0 +1,18 @@
+# Managed by vm-platform init.yml — supplemental L2/IPv6/DHCP guard for private bridges only.
+# PVE Firewall remains the primary L3/L4 connection-policy engine.
+add table bridge vmp_guard
+flush table bridge vmp_guard
+
+table bridge vmp_guard {
+  chain ingress {
+    type filter hook prerouting priority -300; policy accept;
+    iifname "tap*" meta ibrname { "{{ vmp_networks.internal.bridge }}", "{{ vmp_networks.isolated.bridge }}" } ether type != { ip, arp } drop;
+    iifname "tap*" meta ibrname { "{{ vmp_networks.internal.bridge }}", "{{ vmp_networks.isolated.bridge }}" } ether type ip udp sport { 67, 68 } drop;
+    iifname "tap*" meta ibrname { "{{ vmp_networks.internal.bridge }}", "{{ vmp_networks.isolated.bridge }}" } ether type ip udp dport { 67, 68 } drop;
+  }
+
+  chain forward {
+    type filter hook forward priority -300; policy accept;
+    oifname "tap*" meta obrname { "{{ vmp_networks.internal.bridge }}", "{{ vmp_networks.isolated.bridge }}" } ether type != { ip, arp } drop;
+  }
+}

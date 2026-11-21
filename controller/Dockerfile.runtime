@@ -1,0 +1,2 @@
+FROM vm-platform-controller:tools
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client=1:9.2p1-2+deb12u10 && rm -rf /var/lib/apt/lists/* && dpkg-query -W -f='${Package}=${Version}\n' > /opt/toolchain/debian-packages.lock

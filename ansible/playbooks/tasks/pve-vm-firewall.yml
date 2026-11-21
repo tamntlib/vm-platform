@@ -1,0 +1,79 @@
+---
+# Apply Proxmox VM firewall options, optional ipfilter IP sets, and exact ordered rules.
+# Inputs: fw_node, fw_vmid, fw_options (dict), fw_ip_sets (list, optional), fw_rules (list of dicts)
+
+- name: "Configure VM {{ fw_vmid }} ipfilter IP sets"
+  community.proxmox.proxmox_firewall:
+    level: vm
+    vmid: "{{ fw_vmid | int }}"
+    ip_sets: "{{ fw_ip_sets }}"
+    update: true
+    state: present
+  when:
+    - not ansible_check_mode
+    - (fw_ip_sets | default([])) | length > 0
+
+- name: "Read current firewall rules on VM {{ fw_vmid }}"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/nodes/{{ fw_node }}/qemu/{{ fw_vmid }}/firewall/rules"
+    method: GET
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    return_content: true
+  register: _vm_fw_before
+  when: not ansible_check_mode
+  no_log: true
+
+- name: "Compare existing VM {{ fw_vmid }} firewall rules with desired rules"
+  ansible.builtin.set_fact:
+    _vm_fw_needs_sync: >-
+      {{
+        (_vm_fw_before.json.data | length) != (fw_rules | length)
+        or (_vm_fw_before.json.data | sort(attribute='pos') | map(attribute='action') | list) != (fw_rules | map(attribute='action') | list)
+        or (_vm_fw_before.json.data | sort(attribute='pos') | map(attribute='type') | list) != (fw_rules | map(attribute='type') | list)
+      }}
+  when: not ansible_check_mode
+
+- name: "Remove stale rules on VM {{ fw_vmid }} from tail to head before syncing"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/nodes/{{ fw_node }}/qemu/{{ fw_vmid }}/firewall/rules/{{ item }}"
+    method: DELETE
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    status_code: [200]
+  loop: "{{ _vm_fw_before.json.data | map(attribute='pos') | sort(reverse=true) | list }}"
+  when:
+    - not ansible_check_mode
+    - _vm_fw_needs_sync | bool
+  no_log: true
+
+- name: "Insert ordered firewall rules on VM {{ fw_vmid }} (POST inserts at pos 0)"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/nodes/{{ fw_node }}/qemu/{{ fw_vmid }}/firewall/rules"
+    method: POST
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    body_format: form-urlencoded
+    body: "{{ item }}"
+    status_code: [200]
+  loop: "{{ fw_rules | reverse | list }}"
+  when:
+    - not ansible_check_mode
+    - _vm_fw_needs_sync | bool
+  no_log: true
+
+- name: "Set VM {{ fw_vmid }} firewall options"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/nodes/{{ fw_node }}/qemu/{{ fw_vmid }}/firewall/options"
+    method: PUT
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    body_format: form-urlencoded
+    body: "{{ fw_options }}"
+    status_code: [200]
+  when: not ansible_check_mode
+  no_log: true

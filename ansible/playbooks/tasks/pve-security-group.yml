@@ -1,0 +1,62 @@
+---
+# Reconcile one Proxmox cluster security group in exact rule order.
+# Works around community.proxmox 2.1.0 reversing rules on brand-new groups by
+# creating an empty group shell first, then applying the canonical rule list.
+
+- name: "Check existing cluster security groups before {{ sg_name }}"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/cluster/firewall/groups"
+    method: GET
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    return_content: true
+  register: _sg_list
+  no_log: true
+
+- name: "Create empty security group shell for {{ sg_name }} when absent"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/cluster/firewall/groups"
+    method: POST
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    body_format: form-urlencoded
+    body:
+      group: "{{ sg_name }}"
+      comment: "Managed by vm-platform"
+    status_code: [200]
+  when:
+    - not ansible_check_mode
+    - sg_name not in (_sg_list.json.data | map(attribute='group') | list)
+  no_log: true
+
+- name: "Apply ordered rules to security group {{ sg_name }}"
+  community.proxmox.proxmox_cluster_firewall_security_group:
+    name: "{{ sg_name }}"
+    comment: "Managed by vm-platform"
+    rules: "{{ sg_rules }}"
+    state: present
+  when: not ansible_check_mode
+
+- name: "Verify security group {{ sg_name }} rule count and order"
+  ansible.builtin.uri:
+    url: "{{ pve_api_base }}/cluster/firewall/groups/{{ sg_name }}"
+    method: GET
+    headers: "{{ pve_api_headers }}"
+    ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+    validate_certs: "{{ pve_validate_certs }}"
+    return_content: true
+  register: _sg_after
+  when: not ansible_check_mode
+  no_log: true
+
+- name: "Assert {{ sg_name }} matches exact expected rule order"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - (_sg_after.json.data | length) == (sg_rules | length)
+      - (_sg_after.json.data | sort(attribute='pos') | map(attribute='action') | list) == (sg_rules | map(attribute='action') | list)
+      - (_sg_after.json.data | sort(attribute='pos') | map(attribute='type') | list) == (sg_rules | map(attribute='type') | list)
+    fail_msg: "Security group {{ sg_name }} rule order mismatch after apply"
+  when: not ansible_check_mode

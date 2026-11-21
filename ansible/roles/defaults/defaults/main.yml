@@ -1,0 +1,162 @@
+---
+# Neutral defaults (lowest Ansible precedence — override in your local inventory.yml).
+
+# Proxmox cluster API (override pve_api_host and token env vars for your environment)
+pve_primary_node: "{{ groups['proxmox_nodes'][0] | default('pve01') }}"
+pve_api_host: "{{ lookup('ansible.builtin.env', 'VP_API_HOST') | default('pve.example.local', true) }}"
+pve_api_port: "{{ lookup('ansible.builtin.env', 'VP_API_PORT') | default(8006, true) | int }}"
+pve_api_user: "{{ lookup('ansible.builtin.env', 'VP_API_USER') | default('root@pam', true) }}"
+pve_api_token_id: "{{ lookup('ansible.builtin.env', 'VP_API_TOKEN_ID') }}"
+pve_api_token_secret: "{{ lookup('ansible.builtin.env', 'VP_API_TOKEN_SECRET') }}"
+pve_api_ca_file: "{{ lookup('ansible.builtin.env', 'VP_API_CA_FILE') | default('', true) }}"
+pve_validate_certs: "{{ (lookup('ansible.builtin.env', 'VP_API_VALIDATE_CERTS') | default('true', true)) | bool }}"
+pve_api_base: "https://{{ pve_api_host }}:{{ pve_api_port }}/api2/json"
+pve_api_headers:
+  Authorization: "PVEAPIToken={{ pve_api_user }}!{{ pve_api_token_id }}={{ pve_api_token_secret }}"
+
+# Proxmox storage & VMID range
+vmp_vm_storage: local-lvm
+vmp_image_storage: local
+vmp_vmid_min: 102
+vmp_vmid_max: 999
+
+# Existing LAN / management network (bridge vmbr0 is never modified by init.yml)
+vmp_lan_bridge: vmbr0
+vmp_lan_cidr: 192.168.100.0/24
+vmp_lan_prefixlen: "{{ vmp_lan_cidr.split('/')[1] | int }}"
+vmp_lan_gateway: 192.168.100.1
+vmp_lan_mtu: 1500
+vmp_lan_pool_prefix: "192.168.100."
+vmp_lan_pool_start: 50
+vmp_lan_pool_end: 99
+vmp_lan_nameservers:
+  - 1.1.1.1
+  - 8.8.8.8
+vmp_dns_upstreams:
+  - 1.1.1.1
+  - 8.8.8.8
+
+# Two free static LAN IPs for shared Gateway and Bastion SSH ingress
+vmp_gateway_lan_ip: 192.168.100.250
+vmp_bastion_lan_ip: 192.168.100.251
+
+# Controller SSH keypair used to manage Gateway & Bastion
+vmp_admin_user: vmpadmin
+vmp_admin_ssh_public_key_file: "{{ lookup('ansible.builtin.env', 'VP_ADMIN_SSH_PUBKEY') | default('~/.ssh/id_ed25519.pub', true) }}"
+vmp_admin_ssh_private_key_file: "{{ lookup('ansible.builtin.env', 'VP_ADMIN_SSH_KEY') | default('~/.ssh/id_ed25519', true) }}"
+vmp_known_hosts_file: "{{ lookup('ansible.builtin.env', 'VP_KNOWN_HOSTS_FILE') | default('./.vmp_known_hosts', true) }}"
+
+# Private networks created once per node by init.yml (Linux bridge + VXLAN, MTU 1450)
+vmp_internal_vni: 1001
+vmp_internal_cidr: 10.100.1.0/24
+vmp_internal_gateway: 10.100.1.1
+vmp_internal_bastion: 10.100.1.2
+vmp_internal_pool_prefix: "10.100.1."
+vmp_internal_pool_start: 30
+vmp_internal_pool_end: 199
+
+vmp_isolated_vni: 1002
+vmp_isolated_cidr: 10.100.10.0/24
+vmp_isolated_gateway: 10.100.10.1
+vmp_isolated_bastion: 10.100.10.2
+vmp_isolated_pool_prefix: "10.100.10."
+vmp_isolated_pool_start: 30
+vmp_isolated_pool_end: 199
+
+vmp_networks:
+  internal:
+    bridge: vpint
+    vxlan: vxvpint
+    vni: "{{ vmp_internal_vni | int }}"
+    vxlan_port: 4789
+    mtu: 1450
+    cidr: "{{ vmp_internal_cidr }}"
+    prefixlen: "{{ vmp_internal_cidr.split('/')[1] | int }}"
+    gateway: "{{ vmp_internal_gateway }}"
+    bastion: "{{ vmp_internal_bastion }}"
+    pool_prefix: "{{ vmp_internal_pool_prefix }}"
+    pool_start: "{{ vmp_internal_pool_start | int }}"
+    pool_end: "{{ vmp_internal_pool_end | int }}"
+  isolated:
+    bridge: vpiso
+    vxlan: vxvpiso
+    vni: "{{ vmp_isolated_vni | int }}"
+    vxlan_port: 4789
+    mtu: 1450
+    cidr: "{{ vmp_isolated_cidr }}"
+    prefixlen: "{{ vmp_isolated_cidr.split('/')[1] | int }}"
+    gateway: "{{ vmp_isolated_gateway }}"
+    bastion: "{{ vmp_isolated_bastion }}"
+    pool_prefix: "{{ vmp_isolated_pool_prefix }}"
+    pool_start: "{{ vmp_isolated_pool_start | int }}"
+    pool_end: "{{ vmp_isolated_pool_end | int }}"
+  lan:
+    bridge: "{{ vmp_lan_bridge }}"
+    mtu: "{{ vmp_lan_mtu | int }}"
+    cidr: "{{ vmp_lan_cidr }}"
+    prefixlen: "{{ vmp_lan_prefixlen | int }}"
+    gateway: "{{ vmp_lan_gateway }}"
+    bastion: "{{ vmp_bastion_lan_ip }}"
+    pool_prefix: "{{ vmp_lan_pool_prefix }}"
+    pool_start: "{{ vmp_lan_pool_start | int }}"
+    pool_end: "{{ vmp_lan_pool_end | int }}"
+
+# Shared Gateway & Bastion VM definitions (one pair per cluster)
+vmp_gateway:
+  vmid: 100
+  name: vmp-gateway
+  os: debian-13
+  cores: 1
+  memory_mib: 1024
+  disk_gib: 8
+  lan_ip: "{{ vmp_gateway_lan_ip }}"
+  bastion_alias_ip: "{{ vmp_bastion_lan_ip }}"
+  lan_mac: "02:56:4d:00:01:00"
+  internal_mac: "02:56:4d:01:01:00"
+  isolated_mac: "02:56:4d:02:01:00"
+
+vmp_bastion:
+  vmid: 101
+  name: vmp-bastion
+  os: debian-13
+  cores: 1
+  memory_mib: 1024
+  disk_gib: 8
+  internal_ip: "{{ vmp_internal_bastion }}"
+  isolated_ip: "{{ vmp_isolated_bastion }}"
+  internal_mac: "02:56:4d:01:01:01"
+  isolated_mac: "02:56:4d:02:01:01"
+  recipient_port: 2222
+
+# Optional extra protected CIDRs to block from all workloads (e.g. NAS, switches)
+vmp_extra_protected_cidrs: []
+
+# Non-Internet IPv4 ranges blocked from egress unless explicitly allowed above
+vmp_non_internet_cidrs:
+  - 0.0.0.0/8
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 127.0.0.0/8
+  - 169.254.0.0/16
+  - 172.16.0.0/12
+  - 192.0.0.0/24
+  - 192.0.2.0/24
+  - 192.168.0.0/16
+  - 198.18.0.0/15
+  - 198.51.100.0/24
+  - 203.0.113.0/24
+  - 224.0.0.0/4
+  - 240.0.0.0/4
+
+# Cloud image catalog (select via vm.os in vm.yml; download .qcow2 into /var/lib/vz/import/)
+vmp_os_catalog:
+  debian-13:
+    volume: "local:import/debian-13-genericcloud-amd64.qcow2"
+    filename: "debian-13-genericcloud-amd64.qcow2"
+    min_disk_gib: 8
+    min_memory_mib: 512
+  ubuntu-24.04:
+    volume: "local:import/ubuntu-24.04-server-cloudimg-amd64.qcow2"
+    filename: "ubuntu-24.04-server-cloudimg-amd64.qcow2"
+    min_disk_gib: 10
+    min_memory_mib: 1024
