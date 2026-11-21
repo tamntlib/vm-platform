@@ -17,7 +17,7 @@ pve_api_headers:
 # Proxmox storage & VMID range
 vmp_vm_storage: local-lvm
 vmp_image_storage: local
-vmp_vmid_min: 102
+vmp_vmid_min: 103
 vmp_vmid_max: 999
 
 # Existing LAN / management network (bridge vmbr0 is never modified by init.yml)
@@ -36,9 +36,51 @@ vmp_dns_upstreams:
   - 1.1.1.1
   - 8.8.8.8
 
-# Two free static LAN IPs for shared Gateway and Bastion SSH ingress
+# Unused static LAN IPs for shared Gateway, Bastion SSH ingress, and optional Edge HTTPS ingress
 vmp_gateway_lan_ip: 192.168.100.250
 vmp_bastion_lan_ip: 192.168.100.251
+vmp_edge_lan_ip: 192.168.100.252
+
+# Optional shared HTTPS reverse proxy (Caddy on VM 102)
+# Set vmp_edge_enabled: true in inventory.yml to deploy vmp-edge and enable publish.yml.
+vmp_edge_enabled: false
+# Inbound source policy for HTTP/HTTPS into vmp-edge:
+#   public     -> allow 0.0.0.0/0 (works with any DNS provider, no Cloudflare required)
+#   cloudflare -> allow only Cloudflare IPv4 ranges and trust X-Forwarded-For from them
+#   custom     -> use vmp_edge_allowed_cidrs and vmp_edge_trusted_proxies explicitly
+vmp_edge_source_preset: public
+vmp_edge_cloudflare_ipv4_cidrs:
+  - 173.245.48.0/20
+  - 103.21.244.0/22
+  - 103.22.200.0/22
+  - 103.31.4.0/22
+  - 141.101.64.0/18
+  - 108.162.192.0/18
+  - 190.93.240.0/20
+  - 188.114.96.0/20
+  - 197.234.240.0/22
+  - 198.41.128.0/17
+  - 162.158.0.0/15
+  - 104.16.0.0/13
+  - 104.24.0.0/14
+  - 172.64.0.0/13
+  - 131.0.72.0/22
+vmp_edge_allowed_cidrs: []
+vmp_edge_trusted_proxies: []
+vmp_edge_effective_allowed_cidrs: >-
+  {{
+    vmp_edge_cloudflare_ipv4_cidrs if vmp_edge_source_preset == 'cloudflare'
+    else (vmp_edge_allowed_cidrs if vmp_edge_source_preset == 'custom' else ['0.0.0.0/0'])
+  }}
+vmp_edge_effective_trusted_proxies: >-
+  {{
+    vmp_edge_cloudflare_ipv4_cidrs if vmp_edge_source_preset == 'cloudflare'
+    else (vmp_edge_trusted_proxies if vmp_edge_source_preset == 'custom' else [])
+  }}
+vmp_edge_acme_email: ""
+vmp_edge_ports:
+  - 80
+  - 443
 
 # Controller SSH keypair used to manage Gateway & Bastion
 vmp_admin_user: vmpadmin
@@ -52,6 +94,7 @@ vmp_internal_cidr: 10.100.1.0/24
 vmp_internal_gateway: 10.100.1.1
 vmp_internal_bastion: 10.100.1.2
 vmp_internal_pool_prefix: "10.100.1."
+vmp_internal_edge: "{{ vmp_internal_pool_prefix }}3"
 vmp_internal_pool_start: 30
 vmp_internal_pool_end: 199
 
@@ -60,6 +103,7 @@ vmp_isolated_cidr: 10.100.10.0/24
 vmp_isolated_gateway: 10.100.10.1
 vmp_isolated_bastion: 10.100.10.2
 vmp_isolated_pool_prefix: "10.100.10."
+vmp_isolated_edge: "{{ vmp_isolated_pool_prefix }}3"
 vmp_isolated_pool_start: 30
 vmp_isolated_pool_end: 199
 
@@ -74,6 +118,7 @@ vmp_networks:
     prefixlen: "{{ vmp_internal_cidr.split('/')[1] | int }}"
     gateway: "{{ vmp_internal_gateway }}"
     bastion: "{{ vmp_internal_bastion }}"
+    edge: "{{ vmp_internal_edge }}"
     pool_prefix: "{{ vmp_internal_pool_prefix }}"
     pool_start: "{{ vmp_internal_pool_start | int }}"
     pool_end: "{{ vmp_internal_pool_end | int }}"
@@ -87,6 +132,7 @@ vmp_networks:
     prefixlen: "{{ vmp_isolated_cidr.split('/')[1] | int }}"
     gateway: "{{ vmp_isolated_gateway }}"
     bastion: "{{ vmp_isolated_bastion }}"
+    edge: "{{ vmp_isolated_edge }}"
     pool_prefix: "{{ vmp_isolated_pool_prefix }}"
     pool_start: "{{ vmp_isolated_pool_start | int }}"
     pool_end: "{{ vmp_isolated_pool_end | int }}"
@@ -97,11 +143,12 @@ vmp_networks:
     prefixlen: "{{ vmp_lan_prefixlen | int }}"
     gateway: "{{ vmp_lan_gateway }}"
     bastion: "{{ vmp_bastion_lan_ip }}"
+    edge: "{{ vmp_edge_lan_ip }}"
     pool_prefix: "{{ vmp_lan_pool_prefix }}"
     pool_start: "{{ vmp_lan_pool_start | int }}"
     pool_end: "{{ vmp_lan_pool_end | int }}"
 
-# Shared Gateway & Bastion VM definitions (one pair per cluster)
+# Shared Gateway, Bastion, and optional Edge VM definitions (one set per cluster)
 vmp_gateway:
   vmid: 100
   name: vmp-gateway
@@ -127,6 +174,19 @@ vmp_bastion:
   internal_mac: "02:56:4d:01:01:01"
   isolated_mac: "02:56:4d:02:01:01"
   recipient_port: 2222
+
+vmp_edge:
+  vmid: 102
+  name: vmp-edge
+  os: debian-13
+  cores: 1
+  memory_mib: 1024
+  disk_gib: 16
+  lan_alias_ip: "{{ vmp_edge_lan_ip }}"
+  internal_ip: "{{ vmp_internal_edge }}"
+  isolated_ip: "{{ vmp_isolated_edge }}"
+  internal_mac: "02:56:4d:01:01:02"
+  isolated_mac: "02:56:4d:02:01:02"
 
 # Optional extra protected CIDRs to block from all workloads (e.g. NAS, switches)
 vmp_extra_protected_cidrs: []

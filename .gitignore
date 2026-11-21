@@ -11,6 +11,7 @@
 ansible/inventory.yml
 ansible/.vmp_known_hosts
 ansible/vm-*.yml
+ansible/publish-*.yml
 
 # Generated Python output
 __pycache__/

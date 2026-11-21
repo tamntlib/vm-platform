@@ -119,6 +119,11 @@
             vmp_networks.isolated.gateway ~ '/32',
             vmp_networks.isolated.bastion ~ '/32'
           ] -%}
+          {%- if vmp_edge_enabled | bool -%}
+            {%- set _ = cidrs.append(vmp_edge.lan_alias_ip ~ '/32') -%}
+            {%- set _ = cidrs.append(vmp_edge.internal_ip ~ '/32') -%}
+            {%- set _ = cidrs.append(vmp_edge.isolated_ip ~ '/32') -%}
+          {%- endif -%}
           {%- for n in groups['proxmox_nodes'] -%}
             {%- set _ = cidrs.append(hostvars[n].ansible_host ~ '/32') -%}
           {%- endfor -%}
@@ -260,7 +265,7 @@
         ciuser: "{{ vm.ssh_user }}"
         sshkeys: "{{ vm.ssh_public_key | trim }}"
         ciupgrade: false
-        onboot: false
+        onboot: "{{ vm.onboot | default(false) | bool }}"
         boot: order=scsi0
         serial:
           serial0: socket

@@ -18,6 +18,13 @@ table inet vmp_gw {
   set lan_ssh_targets {
     type ipv4_addr;
   }
+{% if (vmp_edge_enabled | bool) and vmp_edge_source_preset != 'public' %}
+  set edge_sources {
+    type ipv4_addr;
+    flags interval;
+    elements = { {{ vmp_edge_effective_allowed_cidrs | join(', ') }} }
+  }
+{% endif %}
 
   chain input {
     type filter hook input priority filter; policy drop;
@@ -29,6 +36,10 @@ table inet vmp_gw {
     iifname "{{ gw_int_iface }}" ip saddr @dns_internal ip daddr {{ vmp_networks.internal.gateway }} tcp dport 53 accept
     iifname "{{ gw_iso_iface }}" ip saddr @dns_isolated ip daddr {{ vmp_networks.isolated.gateway }} udp dport 53 accept
     iifname "{{ gw_iso_iface }}" ip saddr @dns_isolated ip daddr {{ vmp_networks.isolated.gateway }} tcp dport 53 accept
+{% if vmp_edge_enabled | bool %}
+    iifname "{{ gw_int_iface }}" ip saddr {{ vmp_edge.internal_ip }} ip daddr {{ vmp_networks.internal.gateway }} udp dport 53 accept
+    iifname "{{ gw_int_iface }}" ip saddr {{ vmp_edge.internal_ip }} ip daddr {{ vmp_networks.internal.gateway }} tcp dport 53 accept
+{% endif %}
   }
 
   chain output {
@@ -39,6 +50,9 @@ table inet vmp_gw {
     oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_gateway.lan_ip }} ip daddr { {{ vmp_dns_upstreams | join(', ') }} } udp dport 53 accept
     oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_gateway.lan_ip }} ip daddr { {{ vmp_dns_upstreams | join(', ') }} } tcp dport 53 accept
     oifname "{{ gw_int_iface }}" ip saddr {{ vmp_networks.internal.gateway }} ip daddr {{ vmp_bastion.internal_ip }} tcp dport 22 accept
+{% if vmp_edge_enabled | bool %}
+    oifname "{{ gw_int_iface }}" ip saddr {{ vmp_networks.internal.gateway }} ip daddr {{ vmp_edge.internal_ip }} tcp dport 22 accept
+{% endif %}
   }
 
   chain forward {
@@ -47,6 +61,10 @@ table inet vmp_gw {
     ct state established,related accept
     iifname "{{ gw_lan_iface }}" oifname "{{ gw_int_iface }}" ip saddr {{ vmp_lan_cidr }} ip daddr {{ vmp_bastion.internal_ip }} tcp dport {{ vmp_bastion.recipient_port }} ct status dnat accept
     iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_bastion.internal_ip }} ip daddr @lan_ssh_targets tcp dport 22 accept
+{% if vmp_edge_enabled | bool %}
+    iifname "{{ gw_lan_iface }}" oifname "{{ gw_int_iface }}" {% if vmp_edge_source_preset != 'public' %}ip saddr @edge_sources {% endif %}ip daddr {{ vmp_edge.internal_ip }} tcp dport { {{ vmp_edge_ports | join(', ') }} } ct status dnat accept
+    iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_edge.internal_ip }} ip daddr != { {{ vmp_non_internet_cidrs | join(', ') }} } tcp dport { 80, 443 } accept
+{% endif %}
     iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr @egress_internal ip daddr != { {{ vmp_non_internet_cidrs | join(', ') }} } accept
     iifname "{{ gw_iso_iface }}" oifname "{{ gw_lan_iface }}" ip saddr @egress_isolated ip daddr != { {{ vmp_non_internet_cidrs | join(', ') }} } accept
   }
@@ -54,12 +72,18 @@ table inet vmp_gw {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
     iifname "{{ gw_lan_iface }}" ip saddr {{ vmp_lan_cidr }} ip daddr {{ vmp_gateway.bastion_alias_ip }} tcp dport 22 dnat ip to {{ vmp_bastion.internal_ip }}:{{ vmp_bastion.recipient_port }}
+{% if vmp_edge_enabled | bool %}
+    iifname "{{ gw_lan_iface }}" {% if vmp_edge_source_preset != 'public' %}ip saddr @edge_sources {% endif %}ip daddr {{ vmp_edge.lan_alias_ip }} tcp dport { {{ vmp_edge_ports | join(', ') }} } dnat ip to {{ vmp_edge.internal_ip }}
+{% endif %}
   }
 
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     iifname "{{ gw_lan_iface }}" oifname "{{ gw_int_iface }}" ip daddr {{ vmp_bastion.internal_ip }} tcp dport {{ vmp_bastion.recipient_port }} ct status dnat snat ip to {{ vmp_networks.internal.gateway }}
     iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_bastion.internal_ip }} ip daddr @lan_ssh_targets tcp dport 22 snat ip to {{ vmp_gateway.bastion_alias_ip }}
+{% if vmp_edge_enabled | bool %}
+    iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr {{ vmp_edge.internal_ip }} snat ip to {{ vmp_gateway.lan_ip }}
+{% endif %}
     iifname "{{ gw_int_iface }}" oifname "{{ gw_lan_iface }}" ip saddr @egress_internal snat ip to {{ vmp_gateway.lan_ip }}
     iifname "{{ gw_iso_iface }}" oifname "{{ gw_lan_iface }}" ip saddr @egress_isolated snat ip to {{ vmp_gateway.lan_ip }}
   }

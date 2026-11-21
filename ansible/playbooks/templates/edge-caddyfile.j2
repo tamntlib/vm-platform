@@ -1,0 +1,14 @@
+# Managed by vm-platform — shared HTTPS reverse proxy (Caddy).
+{% if vmp_edge_acme_email | default('') | length > 0 %}
+{
+	email {{ vmp_edge_acme_email }}
+}
+
+{% endif %}
+(vmp_proxy_opts) {
+{% if vmp_edge_effective_trusted_proxies | length > 0 %}
+	trusted_proxies {{ vmp_edge_effective_trusted_proxies | join(' ') }}
+{% endif %}
+}
+
+import /etc/caddy/sites.d/*.caddy

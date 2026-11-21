@@ -1,0 +1,9 @@
+---
+publish:
+  vmid: 103
+  domain: app.example.com
+  port: 3001
+  # tls_mode: auto             # auto (Let's Encrypt via Caddy) | custom
+  # tls_cert_file: /etc/caddy/certs/origin.pem   # required only when tls_mode: custom
+  # tls_key_file: /etc/caddy/certs/origin.key    # required only when tls_mode: custom
+  # state: present             # present | absent (to unpublish a route)

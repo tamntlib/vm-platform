@@ -19,9 +19,18 @@ all:
     vmp_lan_pool_start: 50
     vmp_lan_pool_end: 99
 
-    # Two unused static LAN IPs for the shared Gateway and Bastion SSH ingress
+    # Unused static LAN IPs for shared Gateway, Bastion SSH ingress, and optional Edge HTTPS ingress
     vmp_gateway_lan_ip: 192.168.100.250
     vmp_bastion_lan_ip: 192.168.100.251
+
+    # Optional: shared Caddy HTTPS reverse proxy (VM 102) for publishing domains via publish.yml
+    # Forward WAN TCP 80 and 443 on your router to vmp_edge_lan_ip once, then publish any VM with publish.yml.
+    # vmp_edge_enabled: true
+    # vmp_edge_lan_ip: 192.168.100.252
+    # vmp_edge_source_preset: public      # public (default, any DNS) | cloudflare (Cloudflare Proxy IPv4 only) | custom
+    # vmp_edge_acme_email: ""             # optional email for Let's Encrypt notifications
+    # vmp_edge_allowed_cidrs: []          # required only when vmp_edge_source_preset: custom
+    # vmp_edge_trusted_proxies: []        # optional when vmp_edge_source_preset: custom
 
     # Controller SSH keypair for managing Gateway & Bastion
     vmp_admin_ssh_public_key_file: ~/.ssh/id_ed25519.pub

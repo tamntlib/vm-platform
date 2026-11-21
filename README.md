@@ -69,13 +69,32 @@ ansible-playbook -i inventory.yml playbooks/create.yml -e @vm-app01.yml
 - Add `--check` to preview auto-picked VMID/IP/MAC without creating anything.
 - `create.yml` imports the cloud image onto `local-lvm`, applies PVE Firewall **before boot**, and adds only this VM's drop-in config on Gateway & Bastion without stopping Gateway, Bastion, or other VMs.
 
-### 4. Delete a VM (`delete.yml`)
+### 4. Publish a domain via optional shared Edge reverse proxy (`publish.yml`)
 
-Removes only that VM's Bastion user/config, Gateway drop-in, cluster IPSet entry, and Proxmox VM + disk (zero downtime for Gateway, Bastion, and other VMs; refuses VMID `100`/`101`):
+To expose HTTP(S) apps running on `isolated` or `internal` VMs through one shared Caddy VM (`102`):
+
+1. Enable Edge in your `ansible/inventory.yml` and re-run `init.yml`:
+   - `vmp_edge_enabled: true`
+   - `vmp_edge_lan_ip: 192.168.100.252` (unused static LAN IP; forward WAN TCP `80` and `443` from your router to this IP once)
+   - `vmp_edge_source_preset: public` (default — allows any client and auto-issues Let's Encrypt TLS via Caddy with any DNS provider; set `cloudflare` to restrict ingress to Cloudflare Proxy IPv4 ranges + `trusted_proxies`, or `custom` for explicit CIDRs)
+2. Copy `ansible/publish.example.yml` to `ansible/publish-app01.yml` (git-ignored) and run:
 
 ```bash
 cd ansible
-ansible-playbook -i inventory.yml playbooks/delete.yml -e vmid=102
+ansible-playbook -i inventory.yml playbooks/publish.yml -e @publish-app01.yml
+```
+
+- Opens only `vmp-edge -> VM:port` in PVE Firewall on both VMs and drops a per-site Caddyfile (zero downtime for other apps).
+- Supports `tls_mode: auto` (default Let's Encrypt) or `tls_mode: custom` (custom/Origin CA cert files placed in `/etc/caddy/certs/`).
+- Set `state: absent` in your publish file to unpublish a route cleanly.
+
+### 5. Delete a VM (`delete.yml`)
+
+Removes only that VM's published Caddy sites/rules (if Edge is enabled), Bastion user/config, Gateway drop-in, cluster IPSet entry, and Proxmox VM + disk (zero downtime for Gateway, Bastion, Edge, and other VMs; refuses VMID `100`/`101`/`102`):
+
+```bash
+cd ansible
+ansible-playbook -i inventory.yml playbooks/delete.yml -e vmid=103
 ```
 
 ## Adding another Proxmox node in the same cluster

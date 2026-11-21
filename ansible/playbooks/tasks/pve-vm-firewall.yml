@@ -27,12 +27,41 @@
 
 - name: "Compare existing VM {{ fw_vmid }} firewall rules with desired rules"
   ansible.builtin.set_fact:
-    _vm_fw_needs_sync: >-
-      {{
-        (_vm_fw_before.json.data | length) != (fw_rules | length)
-        or (_vm_fw_before.json.data | sort(attribute='pos') | map(attribute='action') | list) != (fw_rules | map(attribute='action') | list)
-        or (_vm_fw_before.json.data | sort(attribute='pos') | map(attribute='type') | list) != (fw_rules | map(attribute='type') | list)
-      }}
+    _vm_fw_current_sig: >-
+      {%- set out = [] -%}
+      {%- for r in _vm_fw_before.json.data | sort(attribute='pos') -%}
+        {%- set _ = out.append([
+          r.type | default('') | string,
+          r.action | default('') | string,
+          r.iface | default('') | string,
+          r.source | default('') | string,
+          r.dest | default('') | string,
+          r.proto | default('') | string,
+          r.dport | default('') | string,
+          r.comment | default('') | string
+        ]) -%}
+      {%- endfor -%}
+      {{ out }}
+    _vm_fw_desired_sig: >-
+      {%- set out = [] -%}
+      {%- for r in fw_rules -%}
+        {%- set _ = out.append([
+          r.type | default('') | string,
+          r.action | default('') | string,
+          r.iface | default('') | string,
+          r.source | default('') | string,
+          r.dest | default('') | string,
+          r.proto | default('') | string,
+          r.dport | default('') | string,
+          r.comment | default('') | string
+        ]) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: not ansible_check_mode
+
+- name: "Determine if VM {{ fw_vmid }} firewall rules need sync"
+  ansible.builtin.set_fact:
+    _vm_fw_needs_sync: "{{ _vm_fw_current_sig != _vm_fw_desired_sig }}"
   when: not ansible_check_mode
 
 - name: "Remove stale rules on VM {{ fw_vmid }} from tail to head before syncing"

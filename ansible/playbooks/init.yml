@@ -5,7 +5,7 @@
 #   3. One shared Debian Gateway VM (vmid 100) + OpenSSH Bastion VM (vmid 101) for the cluster
 # Safe to re-run when adding a new node to proxmox_nodes in inventory.yml.
 
-- name: "1/5 Prepare private networks and host guard on all Proxmox cluster nodes"
+- name: "1/6 Prepare private networks and host guard on all Proxmox cluster nodes"
   hosts: proxmox_nodes
   gather_facts: false
   become: true
@@ -126,7 +126,7 @@
         daemon_reload: true
       when: not ansible_check_mode
 
-- name: "2/5 Configure Proxmox cluster firewall IPSets and Security Groups"
+- name: "2/6 Configure Proxmox cluster firewall IPSets and Security Groups"
   hosts: localhost
   connection: local
   gather_facts: false
@@ -150,7 +150,9 @@
           - (groups['proxmox_nodes'] | default([]) | length) >= 1
           - pve_api_token_id | length > 0
           - pve_api_token_secret | length > 0
-        fail_msg: "Configure proxmox_nodes in inventory.yml and export VP_API_TOKEN_ID / VP_API_TOKEN_SECRET."
+          - vmp_edge_source_preset in ['public', 'cloudflare', 'custom']
+          - (not (vmp_edge_enabled | bool)) or vmp_edge_source_preset != 'custom' or (vmp_edge_allowed_cidrs | length > 0)
+        fail_msg: "Configure proxmox_nodes in inventory.yml, export VP_API_TOKEN_ID / VP_API_TOKEN_SECRET, and verify vmp_edge_source_preset."
       check_mode: false
 
     - name: Verify Proxmox cluster firewall is enabled
@@ -184,7 +186,7 @@
       check_mode: false
       no_log: true
 
-    - name: Build protected IPSet entries covering router, all cluster nodes, Gateway, and Bastion
+    - name: Build protected IPSet entries covering router, all cluster nodes, Gateway, Bastion, and optional Edge
       ansible.builtin.set_fact:
         _protected_ipset_cidrs: >-
           {%- set cidrs = [
@@ -196,6 +198,11 @@
             vmp_networks.isolated.gateway ~ '/32',
             vmp_networks.isolated.bastion ~ '/32'
           ] -%}
+          {%- if vmp_edge_enabled | bool -%}
+            {%- set _ = cidrs.append(vmp_edge.lan_alias_ip ~ '/32') -%}
+            {%- set _ = cidrs.append(vmp_edge.internal_ip ~ '/32') -%}
+            {%- set _ = cidrs.append(vmp_edge.isolated_ip ~ '/32') -%}
+          {%- endif -%}
           {%- for n in groups['proxmox_nodes'] -%}
             {%- set _ = cidrs.append(hostvars[n].ansible_host ~ '/32') -%}
           {%- endfor -%}
@@ -207,6 +214,12 @@
             {%- set _ = out.append({'cidr': c}) -%}
           {%- endfor -%}
           {{ out }}
+        _edge_source_ipset_cidrs: >-
+          {%- set out = [] -%}
+          {%- for c in vmp_edge_effective_allowed_cidrs | unique | sort -%}
+            {%- set _ = out.append({'cidr': c}) -%}
+          {%- endfor -%}
+          {{ out }}
       check_mode: false
 
     - name: Ensure protected and company cluster IPSets exist with current members
@@ -214,14 +227,30 @@
         level: cluster
         update: true
         state: present
-        ip_sets:
-          - name: vmp_protected
-            comment: "vm-platform protected infrastructure and management"
-            cidrs: "{{ _protected_ipset_cidrs }}"
-          - name: vmp_company
-            comment: "vm-platform company LAN"
-            cidrs:
-              - cidr: "{{ vmp_lan_cidr }}"
+        ip_sets: >-
+          {{
+            [
+              {
+                'name': 'vmp_protected',
+                'comment': 'vm-platform protected infrastructure and management',
+                'cidrs': _protected_ipset_cidrs
+              },
+              {
+                'name': 'vmp_company',
+                'comment': 'vm-platform company LAN',
+                'cidrs': [{'cidr': vmp_lan_cidr}]
+              }
+            ]
+            + (
+              [
+                {
+                  'name': 'vmp_edge_sources',
+                  'comment': 'vm-platform allowed HTTP/HTTPS edge sources (' ~ vmp_edge_source_preset ~ ')',
+                  'cidrs': _edge_source_ipset_cidrs
+                }
+              ] if ((vmp_edge_enabled | bool) and vmp_edge_source_preset != 'public') else []
+            )
+          }}
       when: not ansible_check_mode
 
     - name: Create empty workload profile IPSets when absent (never wipes existing members)
@@ -326,7 +355,7 @@
             + _non_internet_drops
           }}
 
-- name: "3/5 Provision single shared Gateway and Bastion VMs for the cluster"
+- name: "3/6 Provision single shared Gateway, Bastion, and optional Edge VMs for the cluster"
   hosts: localhost
   connection: local
   gather_facts: false
@@ -360,21 +389,24 @@
       check_mode: false
       no_log: true
 
-    - name: Locate existing Gateway and Bastion across the cluster
+    - name: Locate existing Gateway, Bastion, and Edge across the cluster
       ansible.builtin.set_fact:
         _gw_row: "{{ (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_gateway.vmid | int) | list | first) | default({}) }}"
         _bastion_row: "{{ (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_bastion.vmid | int) | list | first) | default({}) }}"
+        _edge_row: "{{ (cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_edge.vmid | int) | list | first) | default({}) }}"
       check_mode: false
 
-    - name: Resolve Gateway/Bastion presence and host nodes
+    - name: Resolve Gateway/Bastion/Edge presence and host nodes
       ansible.builtin.set_fact:
         _gw_exists: "{{ (_gw_row | length) > 0 }}"
         _gw_node: "{{ _gw_row.node | default(pve_primary_node) }}"
         _bastion_exists: "{{ (_bastion_row | length) > 0 }}"
         _bastion_node: "{{ _bastion_row.node | default(pve_primary_node) }}"
+        _edge_exists: "{{ (_edge_row | length) > 0 }}"
+        _edge_node: "{{ _edge_row.node | default(pve_primary_node) }}"
       check_mode: false
 
-    - name: Verify Gateway/Bastion cloud image exists on {{ pve_primary_node }} when creating either VM
+    - name: Verify Gateway/Bastion/Edge cloud image exists on {{ pve_primary_node }} when creating any infra VM
       ansible.builtin.uri:
         url: "{{ pve_api_base }}/nodes/{{ pve_primary_node }}/storage/{{ vmp_image_storage }}/content?content=import"
         method: GET
@@ -383,16 +415,16 @@
         validate_certs: "{{ pve_validate_certs }}"
         return_content: true
       register: import_contents
-      when: (not _gw_exists) or (not _bastion_exists)
+      when: (not _gw_exists) or (not _bastion_exists) or ((vmp_edge_enabled | bool) and (not _edge_exists))
       check_mode: false
       no_log: true
 
-    - name: Assert gateway/bastion OS image is present
+    - name: Assert gateway/bastion/edge OS image is present
       ansible.builtin.assert:
         quiet: true
         that: vmp_os_catalog[vmp_gateway.os].volume in (import_contents.json.data | map(attribute='volid') | list)
         fail_msg: "Cloud image {{ vmp_os_catalog[vmp_gateway.os].volume }} not found on {{ pve_primary_node }}:{{ vmp_image_storage }}."
-      when: (not _gw_exists) or (not _bastion_exists)
+      when: (not _gw_exists) or (not _bastion_exists) or ((vmp_edge_enabled | bool) and (not _edge_exists))
       check_mode: false
 
     - name: Create Gateway VM ({{ vmp_gateway.vmid }}) on {{ pve_primary_node }}/{{ vmp_vm_storage }} when absent
@@ -443,7 +475,7 @@
         - not ansible_check_mode
         - not _gw_exists
 
-    - name: Build Gateway non-Internet egress DROP rules
+    - name: Build Gateway non-Internet egress DROP rules and optional Edge rules
       ansible.builtin.set_fact:
         _gw_non_internet_drops: >-
           {%- set out = [] -%}
@@ -451,6 +483,27 @@
             {%- set _ = out.append({'type': 'out', 'action': 'DROP', 'iface': 'net0', 'dest': c, 'enable': 1}) -%}
           {%- endfor -%}
           {{ out }}
+        _edge_ports_csv: "{{ vmp_edge_ports | map('string') | join(',') }}"
+        _edge_src_clause: "{{ {'source': '+dc/vmp_edge_sources'} if vmp_edge_source_preset != 'public' else {} }}"
+
+    - name: Build Gateway optional Edge firewall rules
+      ansible.builtin.set_fact:
+        _gw_edge_head_rules: >-
+          {{
+            [
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net0', 'dest': vmp_edge.lan_alias_ip ~ '/32', 'proto': 'tcp', 'dport': _edge_ports_csv, 'enable': 1} | combine(_edge_src_clause),
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net1', 'dest': vmp_edge.internal_ip ~ '/32',  'proto': 'tcp', 'dport': _edge_ports_csv, 'enable': 1} | combine(_edge_src_clause),
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_networks.internal.gateway ~ '/32', 'dest': vmp_edge.internal_ip ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_edge.internal_ip ~ '/32', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_edge.internal_ip ~ '/32', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1}
+            ] if (vmp_edge_enabled | bool) else []
+          }}
+        _gw_edge_egress_rules: >-
+          {{
+            [
+              {'type': 'in', 'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_edge.internal_ip ~ '/32', 'proto': 'tcp', 'dport': '80,443', 'enable': 1}
+            ] if (vmp_edge_enabled | bool) else []
+          }}
 
     - name: Apply PVE Firewall to Gateway VM ({{ vmp_gateway.vmid }}) before boot
       ansible.builtin.include_tasks: tasks/pve-vm-firewall.yml
@@ -481,13 +534,19 @@
               {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'dest': vmp_networks.isolated.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
               {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'dest': vmp_networks.isolated.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1},
               {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': vmp_bastion.internal_ip ~ '/32', 'dest': '+dc/vmp_lan', 'proto': 'tcp', 'dport': '22', 'enable': 1},
-              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_gateway.bastion_alias_ip ~ '/32', 'dest': '+dc/vmp_lan', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_gateway.bastion_alias_ip ~ '/32', 'dest': '+dc/vmp_lan', 'proto': 'tcp', 'dport': '22', 'enable': 1}
+            ]
+            + _gw_edge_head_rules
+            + [
               {'type': 'in',  'action': 'DROP',   'iface': 'net1', 'dest': '+dc/vmp_protected', 'enable': 1},
               {'type': 'in',  'action': 'DROP',   'iface': 'net2', 'dest': '+dc/vmp_protected', 'enable': 1},
               {'type': 'in',  'action': 'DROP',   'iface': 'net1', 'dest': '+dc/vmp_company', 'enable': 1},
               {'type': 'in',  'action': 'DROP',   'iface': 'net2', 'dest': '+dc/vmp_company', 'enable': 1},
               {'type': 'in',  'action': 'ACCEPT', 'iface': 'net1', 'source': '+dc/vmp_internal', 'enable': 1},
-              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net2', 'source': '+dc/vmp_isolated', 'enable': 1}
+            ]
+            + _gw_edge_egress_rules
+            + [
               {'type': 'out', 'action': 'DROP',   'iface': 'net0', 'dest': '+dc/vmp_protected', 'enable': 1},
               {'type': 'out', 'action': 'DROP',   'iface': 'net0', 'dest': '+dc/vmp_company', 'enable': 1}
             ]
@@ -588,6 +647,148 @@
         state: started
       when: not ansible_check_mode
 
+    - name: Create Edge Reverse Proxy VM ({{ vmp_edge.vmid }}) on {{ pve_primary_node }}/{{ vmp_vm_storage }} when enabled and absent
+      community.proxmox.proxmox_kvm:
+        node: "{{ pve_primary_node }}"
+        vmid: "{{ vmp_edge.vmid }}"
+        name: "{{ vmp_edge.name }}"
+        description: "vm-platform shared Caddy HTTPS edge"
+        cores: "{{ vmp_edge.cores }}"
+        memory: "{{ vmp_edge.memory_mib }}"
+        cpu: host
+        scsihw: virtio-scsi-single
+        scsi:
+          scsi0: "{{ vmp_vm_storage }}:0,import-from={{ vmp_os_catalog[vmp_edge.os].volume }}"
+        ide:
+          ide2: "{{ vmp_vm_storage }}:cloudinit"
+        net:
+          net0: "virtio={{ vmp_edge.internal_mac }},bridge={{ vmp_networks.internal.bridge }},firewall=1,mtu={{ vmp_networks.internal.mtu }}"
+          net1: "virtio={{ vmp_edge.isolated_mac }},bridge={{ vmp_networks.isolated.bridge }},firewall=1,mtu={{ vmp_networks.isolated.mtu }}"
+        ipconfig:
+          ipconfig0: "ip={{ vmp_edge.internal_ip }}/{{ vmp_networks.internal.prefixlen }},gw={{ vmp_networks.internal.gateway }}"
+          ipconfig1: "ip={{ vmp_edge.isolated_ip }}/{{ vmp_networks.isolated.prefixlen }}"
+        nameservers:
+          - "{{ vmp_networks.internal.gateway }}"
+        ciuser: "{{ vmp_admin_user }}"
+        sshkeys: "{{ _admin_pubkey }}"
+        ciupgrade: false
+        onboot: true
+        boot: order=scsi0
+        serial:
+          serial0: socket
+        vga: serial0
+        agent: "yes"
+        timeout: 180
+        state: present
+      when:
+        - not ansible_check_mode
+        - vmp_edge_enabled | bool
+        - not _edge_exists
+
+    - name: Resize Edge disk to {{ vmp_edge.disk_gib }}G
+      community.proxmox.proxmox_disk:
+        vmid: "{{ vmp_edge.vmid }}"
+        disk: scsi0
+        size: "{{ vmp_edge.disk_gib }}G"
+        state: resized
+      when:
+        - not ansible_check_mode
+        - vmp_edge_enabled | bool
+        - not _edge_exists
+
+    - name: Read existing Edge VM ({{ vmp_edge.vmid }}) firewall rules to preserve published routes
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _edge_node }}/qemu/{{ vmp_edge.vmid }}/firewall/rules"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _edge_fw_existing
+      when:
+        - not ansible_check_mode
+        - vmp_edge_enabled | bool
+        - _edge_exists | bool
+      no_log: true
+
+    - name: Build preserved publish rules and non-Internet drops for Edge VM ({{ vmp_edge.vmid }})
+      ansible.builtin.set_fact:
+        _edge_preserved_pub_rules: >-
+          {%- set out = [] -%}
+          {%- if (vmp_edge_enabled | bool) and (_edge_exists | bool) and (not ansible_check_mode) -%}
+            {%- for r in _edge_fw_existing.json.data | sort(attribute='pos') -%}
+              {%- if (r.comment | default('')).startswith('vmp-pub-') -%}
+                {%- set clean = {} -%}
+                {%- for k in ['type', 'action', 'iface', 'source', 'dest', 'proto', 'dport', 'comment', 'enable'] -%}
+                  {%- if r[k] is defined -%}
+                    {%- set _ = clean.update({k: r[k]}) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- set _ = out.append(clean) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ out }}
+        _edge_non_internet_drops: >-
+          {%- set out = [] -%}
+          {%- for c in vmp_non_internet_cidrs -%}
+            {%- set _ = out.append({'type': 'out', 'action': 'DROP', 'dest': c, 'enable': 1}) -%}
+          {%- endfor -%}
+          {{ out }}
+      when: vmp_edge_enabled | bool
+
+    - name: Apply PVE Firewall to Edge VM ({{ vmp_edge.vmid }}) before boot
+      ansible.builtin.include_tasks: tasks/pve-vm-firewall.yml
+      vars:
+        fw_node: "{{ _edge_node }}"
+        fw_vmid: "{{ vmp_edge.vmid }}"
+        fw_ip_sets:
+          - name: ipfilter-net0
+            cidrs:
+              - cidr: "{{ vmp_edge.internal_ip }}/32"
+          - name: ipfilter-net1
+            cidrs:
+              - cidr: "{{ vmp_edge.isolated_ip }}/32"
+        fw_options:
+          enable: 1
+          dhcp: 0
+          ndp: 0
+          radv: 0
+          ipfilter: 1
+          macfilter: 1
+          policy_in: DROP
+          policy_out: DROP
+        fw_rules: >-
+          {{
+            _edge_preserved_pub_rules
+            + [
+              {'type': 'in',  'action': 'DROP',   'source': '::/0', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest':   '::/0', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_networks.internal.gateway ~ '/32', 'dest': vmp_edge.internal_ip ~ '/32', 'proto': 'tcp', 'dport': '22', 'enable': 1},
+              {'type': 'in',  'action': 'ACCEPT', 'iface': 'net0', 'dest': vmp_edge.internal_ip ~ '/32', 'proto': 'tcp', 'dport': _edge_ports_csv, 'enable': 1} | combine(_edge_src_clause),
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_edge.internal_ip ~ '/32', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'udp', 'dport': '53', 'enable': 1},
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_edge.internal_ip ~ '/32', 'dest': vmp_networks.internal.gateway ~ '/32', 'proto': 'tcp', 'dport': '53', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest': '+dc/vmp_protected', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest': '+dc/vmp_company', 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest': vmp_networks.internal.cidr, 'enable': 1},
+              {'type': 'out', 'action': 'DROP',   'dest': vmp_networks.isolated.cidr, 'enable': 1}
+            ]
+            + _edge_non_internet_drops
+            + [
+              {'type': 'out', 'action': 'ACCEPT', 'iface': 'net0', 'source': vmp_edge.internal_ip ~ '/32', 'dest': '0.0.0.0/0', 'proto': 'tcp', 'dport': '80,443', 'enable': 1}
+            ]
+          }}
+      when: vmp_edge_enabled | bool
+
+    - name: Start Edge VM ({{ vmp_edge.vmid }})
+      community.proxmox.proxmox_kvm:
+        node: "{{ _edge_node }}"
+        vmid: "{{ vmp_edge.vmid }}"
+        state: started
+      when:
+        - not ansible_check_mode
+        - vmp_edge_enabled | bool
+
     - name: Wait for Gateway SSH ({{ vmp_gateway.lan_ip }}:22) to come up
       ansible.builtin.wait_for:
         host: "{{ vmp_gateway.lan_ip }}"
@@ -596,7 +797,7 @@
         delay: 5
       when: not ansible_check_mode
 
-    - name: Register Gateway and Bastion in dynamic Ansible inventory
+    - name: Register Gateway, Bastion, and optional Edge in dynamic Ansible inventory
       ansible.builtin.add_host:
         name: "{{ item.name }}"
         ansible_connection: ssh
@@ -606,18 +807,33 @@
         ansible_ssh_common_args: "{{ item.ssh_args }}"
         ansible_python_interpreter: /usr/bin/python3
         ansible_remote_tmp: /tmp/.ansible-vmp
-      loop:
-        - name: vmp_gateway
-          host: "{{ vmp_gateway.lan_ip }}"
-          ssh_args: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
-        - name: vmp_bastion
-          host: "{{ vmp_bastion.internal_ip }}"
-          ssh_args: >-
-            -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
-            -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+      loop: >-
+        {{
+          [
+            {
+              'name': 'vmp_gateway',
+              'host': vmp_gateway.lan_ip,
+              'ssh_args': '-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3'
+            },
+            {
+              'name': 'vmp_bastion',
+              'host': vmp_bastion.internal_ip,
+              'ssh_args': '-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ProxyCommand="ssh -i ' ~ vmp_admin_ssh_private_key_file ~ ' -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p ' ~ vmp_admin_user ~ '@' ~ vmp_gateway.lan_ip ~ '"'
+            }
+          ]
+          + (
+            [
+              {
+                'name': 'vmp_edge',
+                'host': vmp_edge.internal_ip,
+                'ssh_args': '-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ProxyCommand="ssh -i ' ~ vmp_admin_ssh_private_key_file ~ ' -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p ' ~ vmp_admin_user ~ '@' ~ vmp_gateway.lan_ip ~ '"'
+              }
+            ] if (vmp_edge_enabled | bool) else []
+          )
+        }}
       when: not ansible_check_mode
 
-- name: "4/5 Configure Debian Gateway (routing, nftables, DNS)"
+- name: "4/6 Configure Debian Gateway (routing, nftables, DNS)"
   hosts: vmp_gateway
   gather_facts: false
   become: true
@@ -753,6 +969,9 @@
           Type=oneshot
           RemainAfterExit=yes
           ExecStart=/usr/sbin/ip addr replace {{ vmp_gateway.bastion_alias_ip }}/32 dev {{ gw_lan_iface }}
+          {% if vmp_edge_enabled | bool %}
+          ExecStart=/usr/sbin/ip addr replace {{ vmp_edge.lan_alias_ip }}/32 dev {{ gw_lan_iface }}
+          {% endif %}
           ExecStart=/usr/sbin/nft -f /etc/vm-platform-gateway/gateway.nft
           ExecReload=/usr/sbin/nft -f /etc/vm-platform-gateway/gateway.nft
 
@@ -802,7 +1021,7 @@
         state: "{{ 'restarted' if gw_dns_cfg.changed else 'started' }}"
       when: not ansible_check_mode
 
-- name: "5/5 Configure OpenSSH Bastion (forwarding-only ProxyJump)"
+- name: "5/6 Configure OpenSSH Bastion (forwarding-only ProxyJump)"
   hosts: vmp_bastion
   gather_facts: false
   become: true
@@ -885,3 +1104,96 @@
         state: "{{ 'restarted' if (bastion_sshd_cfg.changed or bastion_unit.changed) else 'started' }}"
         daemon_reload: true
       when: not ansible_check_mode
+
+- name: "6/6 Configure Caddy Edge Reverse Proxy (when vmp_edge_enabled is true)"
+  hosts: vmp_edge
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Wait for Edge SSH via Gateway ProxyJump
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+      when: not ansible_check_mode
+
+    - name: Wait for Cloud-init to finish on Edge
+      ansible.builtin.command:
+        argv: [/usr/bin/cloud-init, status, --wait]
+      register: edge_ci
+      changed_when: false
+      failed_when: edge_ci.rc not in [0, 2]
+      when: not ansible_check_mode
+
+    - name: Check if caddy is already installed on Edge
+      ansible.builtin.command:
+        argv: [/usr/bin/dpkg, -s, caddy]
+      register: edge_pkg
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Install Caddy package on Edge when absent
+      ansible.builtin.apt:
+        name:
+          - caddy
+        state: present
+        update_cache: true
+        install_recommends: false
+      when:
+        - not ansible_check_mode
+        - edge_pkg.rc != 0
+
+    - name: Create Caddy per-site drop-in and optional custom certs directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: caddy
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/caddy/sites.d, mode: "0750" }
+        - { path: /etc/caddy/certs, mode: "0750" }
+      when: not ansible_check_mode
+
+    - name: Ensure sites.d has a baseline placeholder file (preserves existing published sites)
+      ansible.builtin.copy:
+        dest: /etc/caddy/sites.d/00-empty.caddy
+        owner: root
+        group: caddy
+        mode: "0640"
+        force: false
+        content: "# Per-VM sites are managed by publish.yml\n"
+      when: not ansible_check_mode
+
+    - name: Render root /etc/caddy/Caddyfile
+      ansible.builtin.template:
+        src: templates/edge-caddyfile.j2
+        dest: /etc/caddy/Caddyfile
+        owner: root
+        group: caddy
+        mode: "0640"
+      register: edge_caddyfile
+      when: not ansible_check_mode
+
+    - name: Validate Caddyfile
+      ansible.builtin.command:
+        argv: [/usr/bin/caddy, validate, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Ensure caddy.service is enabled and started
+      ansible.builtin.systemd_service:
+        name: caddy.service
+        enabled: true
+        state: started
+      when: not ansible_check_mode
+
+    - name: Reload caddy.service when Caddyfile changed
+      ansible.builtin.systemd_service:
+        name: caddy.service
+        state: reloaded
+      when:
+        - not ansible_check_mode
+        - edge_caddyfile.changed

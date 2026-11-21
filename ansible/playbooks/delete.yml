@@ -1,8 +1,8 @@
 ---
-# Delete one workload VM cleanly from any node in the cluster without stopping Gateway, Bastion, or other VMs:
-#   Usage: ansible-playbook -i inventory.yml playbooks/delete.yml -e vmid=102
+# Delete one workload VM cleanly from any node in the cluster without stopping Gateway, Bastion, Edge, or other VMs:
+#   Usage: ansible-playbook -i inventory.yml playbooks/delete.yml -e vmid=103
 
-- name: "1/4 Validate target VMID and locate VM across Proxmox cluster"
+- name: "1/5 Validate target VMID and locate VM across Proxmox cluster"
   hosts: localhost
   connection: local
   gather_facts: false
@@ -10,7 +10,7 @@
   roles:
     - defaults
   tasks:
-    - name: Validate vmid parameter and block deletion of Gateway/Bastion
+    - name: Validate vmid parameter and block deletion of Gateway/Bastion/Edge
       ansible.builtin.assert:
         quiet: true
         that:
@@ -18,8 +18,9 @@
           - (vmid | string) is match('^[0-9]+$')
           - (vmid | int) != (vmp_gateway.vmid | int)
           - (vmid | int) != (vmp_bastion.vmid | int)
+          - (vmid | int) != (vmp_edge.vmid | int)
           - (vmid | int) >= (vmp_vmid_min | int)
-        fail_msg: "Pass a valid workload vmid (e.g. -e vmid=102). Shared Gateway ({{ vmp_gateway.vmid }}) and Bastion ({{ vmp_bastion.vmid }}) cannot be deleted here."
+        fail_msg: "Pass a valid workload vmid (e.g. -e vmid=103). Shared Gateway ({{ vmp_gateway.vmid }}), Bastion ({{ vmp_bastion.vmid }}), and Edge ({{ vmp_edge.vmid }}) cannot be deleted here."
       check_mode: false
 
     - name: Require Proxmox API credentials
@@ -43,11 +44,12 @@
       check_mode: false
       no_log: true
 
-    - name: Locate VM {{ vmid }} in cluster
+    - name: Locate VM {{ vmid }} and optional Edge VM in cluster
       ansible.builtin.set_fact:
         _del_vmid: "{{ vmid | int }}"
         _del_jump_user: "vmp-{{ vmid | int }}"
         _del_vm_row: "{{ (_cluster_vms.json.data | selectattr('vmid', 'equalto', vmid | int) | list | first) | default({}) }}"
+        _del_edge_row: "{{ (_cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_edge.vmid | int) | list | first) | default({}) }}"
       check_mode: false
 
     - name: Extract VM existence, node, and name
@@ -55,6 +57,9 @@
         _del_vm_exists: "{{ (_del_vm_row | length) > 0 }}"
         _del_vm_node: "{{ _del_vm_row.node | default(pve_primary_node) }}"
         _del_vm_name: "{{ _del_vm_row.name | default('(absent)') }}"
+        _del_edge_exists: "{{ (_del_edge_row | length) > 0 }}"
+        _del_edge_running: "{{ (_del_edge_row.status | default('')) == 'running' }}"
+        _del_edge_node: "{{ _del_edge_row.node | default(pve_primary_node) }}"
       check_mode: false
 
     - name: Read VM {{ _del_vmid }} config on {{ _del_vm_node }} when present
@@ -133,7 +138,7 @@
             - "/etc/vm-platform-bastion/keys/{{ _del_jump_user }}"
       when: ansible_check_mode
 
-    - name: Register Gateway and Bastion in dynamic inventory
+    - name: Register Gateway, Bastion, and optional Edge in dynamic inventory
       ansible.builtin.add_host:
         name: "{{ item.name }}"
         ansible_connection: ssh
@@ -143,18 +148,74 @@
         ansible_ssh_common_args: "{{ item.ssh_args }}"
         ansible_python_interpreter: /usr/bin/python3
         ansible_remote_tmp: /tmp/.ansible-vmp
-      loop:
-        - name: vmp_gateway
-          host: "{{ vmp_gateway.lan_ip }}"
-          ssh_args: "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
-        - name: vmp_bastion
-          host: "{{ vmp_bastion.internal_ip }}"
-          ssh_args: >-
-            -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
-            -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+      loop: >-
+        {{
+          [
+            {
+              'name': 'vmp_gateway',
+              'host': vmp_gateway.lan_ip,
+              'ssh_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3'
+            },
+            {
+              'name': 'vmp_bastion',
+              'host': vmp_bastion.internal_ip,
+              'ssh_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ProxyCommand="ssh -i ' ~ vmp_admin_ssh_private_key_file ~ ' -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p ' ~ vmp_admin_user ~ '@' ~ vmp_gateway.lan_ip ~ '"'
+            }
+          ]
+          + (
+            [
+              {
+                'name': 'vmp_edge',
+                'host': vmp_edge.internal_ip,
+                'ssh_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ProxyCommand="ssh -i ' ~ vmp_admin_ssh_private_key_file ~ ' -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ vmp_known_hosts_file ~ ' -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p ' ~ vmp_admin_user ~ '@' ~ vmp_gateway.lan_ip ~ '"'
+              }
+            ] if ((vmp_edge_enabled | bool) and (_del_edge_running | bool)) else []
+          )
+        }}
       when: not ansible_check_mode
 
-- name: "2/4 Remove only this VM's SSH ProxyJump grant on Bastion (no downtime)"
+- name: "2/5 Remove any published Caddy sites for this VM on Edge (no downtime)"
+  hosts: vmp_edge
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _del_vmid: "{{ hostvars.localhost._del_vmid }}"
+  tasks:
+    - name: Find published Caddy site drop-ins owned by VM {{ _del_vmid }}
+      ansible.builtin.find:
+        paths: /etc/caddy/sites.d
+        patterns: "vm-{{ _del_vmid }}-*.caddy"
+      register: _edge_vm_sites
+      when: not ansible_check_mode
+
+    - name: Remove Caddy site files owned by VM {{ _del_vmid }}
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _edge_vm_sites.files | default([]) }}"
+      register: _edge_sites_removed
+      when: not ansible_check_mode
+
+    - name: Validate Caddyfile after removing VM sites
+      ansible.builtin.command:
+        argv: [/usr/bin/caddy, validate, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - _edge_sites_removed.changed | default(false)
+
+    - name: Reload caddy.service (graceful, zero downtime)
+      ansible.builtin.systemd_service:
+        name: caddy.service
+        state: reloaded
+      when:
+        - not ansible_check_mode
+        - _edge_sites_removed.changed | default(false)
+
+- name: "3/5 Remove only this VM's SSH ProxyJump grant on Bastion (no downtime)"
   hosts: vmp_bastion
   gather_facts: false
   become: true
@@ -198,7 +259,7 @@
         force: true
       when: not ansible_check_mode
 
-- name: "3/4 Remove only this VM's DNS/route grant on Gateway (no downtime)"
+- name: "4/5 Remove only this VM's DNS/route grant on Gateway (no downtime)"
   hosts: vmp_gateway
   gather_facts: false
   become: true
@@ -231,7 +292,7 @@
         - not ansible_check_mode
         - _gw_removed.changed
 
-- name: "4/4 Remove IP from cluster IPSet and delete VM + disk on Proxmox"
+- name: "5/5 Remove Edge firewall rules, cluster IPSet entry, and delete VM + disk on Proxmox"
   hosts: localhost
   connection: local
   gather_facts: false
@@ -248,6 +309,43 @@
       validate_certs: "{{ pve_validate_certs }}"
       ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
   tasks:
+    - name: Read Edge VM firewall rules to remove any published backend rules for VM {{ _del_vmid }}
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _del_edge_node }}/qemu/{{ vmp_edge.vmid }}/firewall/rules"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _del_edge_fw
+      when:
+        - not ansible_check_mode
+        - _del_edge_exists | bool
+      no_log: true
+
+    - name: Remove publish firewall rules on Edge VM owned by VM {{ _del_vmid }}
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _del_edge_node }}/qemu/{{ vmp_edge.vmid }}/firewall/rules/{{ item }}"
+        method: DELETE
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: [200]
+      loop: >-
+        {%- set positions = [] -%}
+        {%- if _del_edge_exists | bool and not ansible_check_mode -%}
+          {%- for r in _del_edge_fw.json.data | default([]) -%}
+            {%- if (r.comment | default('')).startswith('vmp-pub-vm-' ~ (_del_vmid | string) ~ '-') -%}
+              {%- set _ = positions.append(r.pos | int) -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+        {{ positions | sort(reverse=true) }}
+      when:
+        - not ansible_check_mode
+        - _del_edge_exists | bool
+      no_log: true
+
     - name: Remove VM IP from cluster firewall IPSet
       ansible.builtin.uri:
         url: "{{ pve_api_base }}/cluster/firewall/ipset/{{ item.set }}/{{ item.cidr | urlencode | replace('/', '%2F') }}"

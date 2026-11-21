@@ -1,0 +1,358 @@
+---
+# Publish or unpublish an HTTP(S) domain on shared vmp-edge (Caddy) for a private workload VM:
+#   Usage: ansible-playbook -i inventory.yml playbooks/publish.yml -e @publish-app.yml
+# Zero downtime for other published domains and other VMs.
+
+- name: "1/3 Validate publish request, locate target VM, and open firewall when publishing"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Resolve publish parameters
+      ansible.builtin.set_fact:
+        _pub_state: "{{ publish.state | default('present') }}"
+        _pub_tls_mode: "{{ publish.tls_mode | default('auto') }}"
+        _pub_tls_cert: "{{ publish.tls_cert_file | default('') }}"
+        _pub_tls_key: "{{ publish.tls_key_file | default('') }}"
+      when: publish is defined and publish is mapping
+      check_mode: false
+
+    - name: Validate publish request fields
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - vmp_edge_enabled | bool
+          - publish is defined and publish is mapping
+          - (publish.vmid | default('') | string) is match('^[0-9]+$')
+          - (publish.vmid | int) >= (vmp_vmid_min | int)
+          - (publish.domain | default('')) is match('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$')
+          - (publish.port | default(0) | int) >= 1
+          - (publish.port | default(0) | int) <= 65535
+          - _pub_state in ['present', 'absent']
+          - _pub_tls_mode in ['auto', 'custom']
+          - _pub_tls_mode != 'custom' or (_pub_tls_cert | length > 0 and _pub_tls_key | length > 0)
+        fail_msg: "Invalid publish declaration or vmp_edge_enabled is false. Check publish.example.yml."
+      check_mode: false
+
+    - name: Require Proxmox API credentials
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - pve_api_token_id | length > 0
+          - pve_api_token_secret | length > 0
+        fail_msg: "Set VP_API_TOKEN_ID and VP_API_TOKEN_SECRET in environment."
+      check_mode: false
+
+    - name: Query cluster VM resources from Proxmox API
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/cluster/resources?type=vm"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _pub_cluster_vms
+      check_mode: false
+      no_log: true
+
+    - name: Locate Gateway, Edge, and target workload VM
+      ansible.builtin.set_fact:
+        _pub_vmid: "{{ publish.vmid | int }}"
+        _pub_domain: "{{ publish.domain | lower }}"
+        _pub_port: "{{ publish.port | int }}"
+        _pub_edge_row: "{{ (_pub_cluster_vms.json.data | selectattr('vmid', 'equalto', vmp_edge.vmid | int) | list | first) | default({}) }}"
+        _pub_vm_row: "{{ (_pub_cluster_vms.json.data | selectattr('vmid', 'equalto', publish.vmid | int) | list | first) | default({}) }}"
+      check_mode: false
+
+    - name: Require vmp-edge and target VM to exist (and vmp-edge running)
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (_pub_edge_row.status | default('')) == 'running'
+          - (_pub_vm_row | length) > 0
+        fail_msg: "vmp-edge ({{ vmp_edge.vmid }}) must be running and target VM {{ _pub_vmid }} must exist."
+      check_mode: false
+
+    - name: Read target VM config to resolve private IP and network profile
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _pub_vm_row.node }}/qemu/{{ _pub_vmid }}/config"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      register: _pub_vm_cfg
+      check_mode: false
+      no_log: true
+
+    - name: Extract target VM private IP, bridge, and edge interface mapping
+      ansible.builtin.set_fact:
+        _pub_vm_ip: "{{ (_pub_vm_cfg.json.data.ipconfig0 | default('')).split('ip=')[1].split(',')[0].split('/')[0] }}"
+        _pub_vm_bridge: "{{ (_pub_vm_cfg.json.data.net0 | default('')).split('bridge=')[1].split(',')[0] }}"
+        _pub_edge_node: "{{ _pub_edge_row.node }}"
+        _pub_vm_node: "{{ _pub_vm_row.node }}"
+      check_mode: false
+
+    - name: Restrict edge publishing to isolated or internal VMs
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - _pub_vm_bridge in [vmp_networks.isolated.bridge, vmp_networks.internal.bridge]
+        fail_msg: "VM {{ _pub_vmid }} is on bridge '{{ _pub_vm_bridge }}'; publish.yml supports private 'isolated' ({{ vmp_networks.isolated.bridge }}) and 'internal' ({{ vmp_networks.internal.bridge }}) VMs."
+      check_mode: false
+
+    - name: Resolve Edge NIC, source IP, rule comment, and Caddy site path
+      ansible.builtin.set_fact:
+        _pub_edge_iface: "{{ 'net1' if _pub_vm_bridge == vmp_networks.isolated.bridge else 'net0' }}"
+        _pub_edge_src_ip: "{{ vmp_edge.isolated_ip if _pub_vm_bridge == vmp_networks.isolated.bridge else vmp_edge.internal_ip }}"
+        _pub_fw_comment: "vmp-pub-vm-{{ _pub_vmid }}-{{ _pub_port }}"
+        _pub_site_file: "/etc/caddy/sites.d/vm-{{ _pub_vmid }}-{{ _pub_domain }}.caddy"
+      check_mode: false
+
+    - name: Preview publish plan in --check mode (no changes made)
+      ansible.builtin.debug:
+        msg:
+          dry_run: true
+          state: "{{ _pub_state }}"
+          vmid: "{{ _pub_vmid | int }}"
+          vm_node: "{{ _pub_vm_node }}"
+          domain: "{{ _pub_domain }}"
+          backend: "http://{{ _pub_vm_ip }}:{{ _pub_port }}"
+          edge_src_ip: "{{ _pub_edge_src_ip }}"
+          edge_lan_ip: "{{ vmp_edge.lan_alias_ip }}"
+          source_preset: "{{ vmp_edge_source_preset }}"
+          tls_mode: "{{ _pub_tls_mode }}"
+          site_file: "{{ _pub_site_file }}"
+          firewall_comment: "{{ _pub_fw_comment }}"
+      when: ansible_check_mode
+
+    - name: Read current firewall rules on vmp-edge and target VM when publishing
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ item.node }}/qemu/{{ item.vmid }}/firewall/rules"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      loop:
+        - { name: edge, node: "{{ _pub_edge_node }}", vmid: "{{ vmp_edge.vmid }}" }
+        - { name: target, node: "{{ _pub_vm_node }}", vmid: "{{ _pub_vmid }}" }
+      register: _pub_fw_reads
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'present'
+      no_log: true
+
+    - name: Ensure vmp-edge PVE Firewall allows OUT to target VM backend port
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _pub_edge_node }}/qemu/{{ vmp_edge.vmid }}/firewall/rules"
+        method: POST
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          type: out
+          action: ACCEPT
+          iface: "{{ _pub_edge_iface }}"
+          source: "{{ _pub_edge_src_ip }}/32"
+          dest: "{{ _pub_vm_ip }}/32"
+          proto: tcp
+          dport: "{{ _pub_port }}"
+          comment: "{{ _pub_fw_comment }}"
+          enable: 1
+        status_code: [200]
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'present'
+        - _pub_fw_comment not in (_pub_fw_reads.results[0].json.data | selectattr('comment', 'defined') | map(attribute='comment') | list)
+      no_log: true
+
+    - name: Ensure target VM PVE Firewall allows IN from vmp-edge to backend port (before Security Group drops)
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _pub_vm_node }}/qemu/{{ _pub_vmid }}/firewall/rules"
+        method: POST
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          type: in
+          action: ACCEPT
+          source: "{{ _pub_edge_src_ip }}/32"
+          dest: "{{ _pub_vm_ip }}/32"
+          proto: tcp
+          dport: "{{ _pub_port }}"
+          comment: "{{ _pub_fw_comment }}"
+          enable: 1
+        status_code: [200]
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'present'
+        - _pub_fw_comment not in (_pub_fw_reads.results[1].json.data | selectattr('comment', 'defined') | map(attribute='comment') | list)
+      no_log: true
+
+    - name: Register vmp-edge in dynamic inventory via Gateway ProxyCommand
+      ansible.builtin.add_host:
+        name: vmp_edge
+        ansible_connection: ssh
+        ansible_host: "{{ vmp_edge.internal_ip }}"
+        ansible_user: "{{ vmp_admin_user }}"
+        ansible_ssh_private_key_file: "{{ vmp_admin_ssh_private_key_file }}"
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+          -o ProxyCommand="ssh -i {{ vmp_admin_ssh_private_key_file }} -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ vmp_known_hosts_file }} -o IdentitiesOnly=yes -o ConnectTimeout=10 -W %h:%p {{ vmp_admin_user }}@{{ vmp_gateway.lan_ip }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_remote_tmp: /tmp/.ansible-vmp
+      when: not ansible_check_mode
+
+- name: "2/3 Update Caddy site drop-in on vmp-edge and reload (zero downtime)"
+  hosts: vmp_edge
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - defaults
+  vars:
+    _pub_state: "{{ hostvars.localhost._pub_state }}"
+    _pub_vmid: "{{ hostvars.localhost._pub_vmid }}"
+    _pub_domain: "{{ hostvars.localhost._pub_domain }}"
+    _pub_vm_ip: "{{ hostvars.localhost._pub_vm_ip }}"
+    _pub_port: "{{ hostvars.localhost._pub_port }}"
+    _pub_tls_mode: "{{ hostvars.localhost._pub_tls_mode }}"
+    _pub_tls_cert: "{{ hostvars.localhost._pub_tls_cert }}"
+    _pub_tls_key: "{{ hostvars.localhost._pub_tls_key }}"
+    _pub_site_file: "{{ hostvars.localhost._pub_site_file }}"
+  tasks:
+    - name: Write Caddy site file for {{ _pub_domain }}
+      ansible.builtin.copy:
+        dest: "{{ _pub_site_file }}"
+        owner: root
+        group: caddy
+        mode: "0640"
+        content: |
+          # Managed by vm-platform publish.yml — VM {{ _pub_vmid }}
+          {{ _pub_domain }} {
+          {% if _pub_tls_mode == 'custom' %}
+          	tls {{ _pub_tls_cert }} {{ _pub_tls_key }}
+          {% endif %}
+          	reverse_proxy http://{{ _pub_vm_ip }}:{{ _pub_port }} {
+          		import vmp_proxy_opts
+          	}
+          }
+      register: _caddy_site_written
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'present'
+
+    - name: Remove Caddy site file for {{ _pub_domain }}
+      ansible.builtin.file:
+        path: "{{ _pub_site_file }}"
+        state: absent
+      register: _caddy_site_removed
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'absent'
+
+    - name: Check if any remaining site file still targets {{ _pub_vm_ip }}:{{ _pub_port }}
+      ansible.builtin.command:
+        argv: [/usr/bin/grep, -rlF, "http://{{ _pub_vm_ip }}:{{ _pub_port }}", /etc/caddy/sites.d]
+      register: _caddy_remaining_refs
+      changed_when: false
+      failed_when: _caddy_remaining_refs.rc not in [0, 1]
+      when:
+        - not ansible_check_mode
+        - _pub_state == 'absent'
+
+    - name: Validate Caddyfile before reload
+      ansible.builtin.command:
+        argv: [/usr/bin/caddy, validate, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - (_caddy_site_written.changed | default(false)) or (_caddy_site_removed.changed | default(false))
+
+    - name: Reload caddy.service (graceful, zero downtime)
+      ansible.builtin.systemd_service:
+        name: caddy.service
+        state: reloaded
+      when:
+        - not ansible_check_mode
+        - (_caddy_site_written.changed | default(false)) or (_caddy_site_removed.changed | default(false))
+
+- name: "3/3 Clean up unused firewall rules on unpublish and print summary"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - defaults
+  tasks:
+    - name: Determine whether backend port firewall rules can be removed
+      ansible.builtin.set_fact:
+        _pub_remove_fw: >-
+          {{
+            (_pub_state == 'absent')
+            and ((hostvars['vmp_edge']._caddy_remaining_refs.stdout | default('') | trim) | length == 0)
+          }}
+      when: not ansible_check_mode
+
+    - name: Read firewall rules on vmp-edge and target VM before cleanup
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ item.node }}/qemu/{{ item.vmid }}/firewall/rules"
+        method: GET
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        return_content: true
+      loop:
+        - { name: edge, node: "{{ _pub_edge_node }}", vmid: "{{ vmp_edge.vmid }}" }
+        - { name: target, node: "{{ _pub_vm_node }}", vmid: "{{ _pub_vmid }}" }
+      register: _pub_fw_cleanup_reads
+      when:
+        - not ansible_check_mode
+        - _pub_remove_fw | bool
+      no_log: true
+
+    - name: Remove unused publish rule from vmp-edge PVE Firewall
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _pub_edge_node }}/qemu/{{ vmp_edge.vmid }}/firewall/rules/{{ item }}"
+        method: DELETE
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: [200]
+      loop: "{{ _pub_fw_cleanup_reads.results[0].json.data | selectattr('comment', 'defined') | selectattr('comment', 'equalto', _pub_fw_comment) | map(attribute='pos') | sort(reverse=true) | list }}"
+      when:
+        - not ansible_check_mode
+        - _pub_remove_fw | bool
+      no_log: true
+
+    - name: Remove unused publish rule from target VM PVE Firewall
+      ansible.builtin.uri:
+        url: "{{ pve_api_base }}/nodes/{{ _pub_vm_node }}/qemu/{{ _pub_vmid }}/firewall/rules/{{ item }}"
+        method: DELETE
+        headers: "{{ pve_api_headers }}"
+        ca_path: "{{ pve_api_ca_file | default(omit, true) }}"
+        validate_certs: "{{ pve_validate_certs }}"
+        status_code: [200]
+      loop: "{{ _pub_fw_cleanup_reads.results[1].json.data | selectattr('comment', 'defined') | selectattr('comment', 'equalto', _pub_fw_comment) | map(attribute='pos') | sort(reverse=true) | list }}"
+      when:
+        - not ansible_check_mode
+        - _pub_remove_fw | bool
+      no_log: true
+
+    - name: Print publish summary
+      ansible.builtin.debug:
+        msg:
+          state: "{{ _pub_state }}"
+          domain: "{{ _pub_domain }}"
+          backend: "http://{{ _pub_vm_ip }}:{{ _pub_port }}"
+          vmid: "{{ _pub_vmid | int }}"
+          edge_lan_ip: "{{ vmp_edge.lan_alias_ip }}"
+          source_preset: "{{ vmp_edge_source_preset }}"
+          tls_mode: "{{ _pub_tls_mode }}"
+      when: not ansible_check_mode
